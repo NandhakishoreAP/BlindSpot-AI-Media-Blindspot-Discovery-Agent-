@@ -1,0 +1,8 @@
+requests
+beautifulsoup4
+duckduckgo-search
+streamlit
+pydantic
+python-dotenv
+ollama
+lxml
