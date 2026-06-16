@@ -163,6 +163,9 @@ class SearchTool:
         return "\n\n".join(formatted_parts)
 
 if __name__ == "__main__":
+    import sys
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
     try:
         # Load config
         config = Config.from_env()
