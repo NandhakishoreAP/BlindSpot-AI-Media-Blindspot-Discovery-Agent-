@@ -18,7 +18,7 @@ class Config:
     def from_env(cls):
         # Reads from environment variables using os.getenv() with fallback defaults
         cls.OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-        cls.OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3:8b")
+        cls.OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3:4b")
         
         try:
             cls.MAX_SEARCH_ATTEMPTS = int(os.getenv("MAX_SEARCH_ATTEMPTS", "5"))
