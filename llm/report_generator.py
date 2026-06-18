@@ -1,1 +1,1103 @@
-# TODO
+import json
+import urllib.parse
+import re
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import List, Dict, Any
+
+from models.data_models import AgentState, BlindspotReport, Blindspot, Evidence
+from llm.ollama_client import OllamaClient
+from utils.logger import get_logger
+from config import Config
+
+REPORT_VERSION = "1.0"
+
+class ReportGenerator:
+    """
+    Synthesizes the final report on discovered blindspots, combining evidence balance,
+    source quality analytics, and LLM-driven explanation.
+    """
+
+    def __init__(self, ollama_client: OllamaClient, config: Config) -> None:
+        """
+        Initializes the ReportGenerator.
+        """
+        self.ollama_client = ollama_client
+        self.config = config
+        self.logger = get_logger("report_generator")
+
+    def _calculate_evidence_balance(self, evidence: List[Evidence]) -> dict:
+        """
+        Calculates counts of evidence that support, contradict, or add context to claims.
+        """
+        balance = {
+            "supports": 0,
+            "contradicts": 0,
+            "adds_context": 0
+        }
+        for ev in evidence:
+            rel = getattr(ev, "relevance", "").lower()
+            if "support" in rel:
+                balance["supports"] += 1
+            elif "contradict" in rel:
+                balance["contradicts"] += 1
+            else:
+                # Default fallback is adds_context
+                balance["adds_context"] += 1
+        return balance
+
+    def _calculate_quality_distribution(self, evidence: List[Evidence]) -> dict:
+        """
+        Calculates counts of low, medium, and high quality evidence sources.
+        """
+        distribution = {
+            "high": 0,
+            "medium": 0,
+            "low": 0
+        }
+        for ev in evidence:
+            qual = getattr(ev, "quality", "").lower()
+            if "high" in qual:
+                distribution["high"] += 1
+            elif "medium" in qual:
+                distribution["medium"] += 1
+            else:
+                # Default fallback is low
+                distribution["low"] += 1
+        return distribution
+
+    def _classify_source_type(self, url: str) -> str:
+        """
+        Classifies evidence source url into news, government, academic, think tank,
+        industry, social media, blog, or other.
+        """
+        if not url:
+            return "other"
+        url_lower = url.lower()
+        try:
+            parsed = urllib.parse.urlparse(url_lower)
+            netloc = parsed.netloc
+            if netloc.startswith("www."):
+                netloc = netloc[4:]
+        except Exception:
+            netloc = url_lower
+            parsed = None
+
+        government_indicators = [".gov", "who.int", "un.org", "worldbank.org", "imf.org"]
+        think_tank_indicators = ["cato.org", "brookings.edu", "heritage.org", "rand.org", "csis.org", "pewresearch.org", "chathamhouse.org", "cfr.org"]
+        academic_indicators = [".edu", "arxiv", "pubmed", "researchgate", "doi.org"]
+        social_media_indicators = ["twitter.com", "x.com", "facebook.com", "reddit.com", "linkedin.com", "youtube.com", "instagram.com"]
+        blog_indicators = ["blogspot.com", "medium.com", "substack.com", "wordpress.com", "blog."]
+        news_domains = [
+            "bbc.com", "bbc.co.uk", "nytimes.com", "reuters.com", "apnews.com",
+            "bloomberg.com", "cnn.com", "theguardian.com", "guardian.co.uk",
+            "economist.com", "wsj.com", "forbes.com", "npr.org", "dw.com",
+            "aljazeera.com", "france24.com", "ft.com"
+        ]
+        industry_indicators = ["mckinsey.com", "gartner.com", "deloitte.com", "accenture.com", "pwc.com", "ey.com", "industry", "marketwatch.com", "nasdaq.com"]
+
+        if any(ind in netloc for ind in government_indicators):
+            return "government"
+        if any(ind in netloc for ind in think_tank_indicators):
+            return "think_tank"
+        if any(ind in netloc for ind in academic_indicators):
+            return "academic"
+        if any(ind in netloc for ind in social_media_indicators):
+            return "social_media"
+        if any(ind in netloc for ind in blog_indicators) or (parsed and "blog" in parsed.path):
+            return "blog"
+        if any(news in netloc for news in news_domains):
+            return "news"
+        if any(ind in netloc for ind in industry_indicators):
+            return "industry"
+
+        return "other"
+
+    def _get_confidence_label(self, score: int) -> str:
+        """
+        Categorizes confidence score into Low, Medium, or High confidence label.
+        """
+        try:
+            val = int(score)
+        except (ValueError, TypeError):
+            val = 0
+            
+        if val <= 30:
+            return "Low Confidence"
+        elif val <= 70:
+            return "Medium Confidence"
+        else:
+            return "High Confidence"
+
+    def _truncate_article_content(self, content: str) -> str:
+        """
+        Truncate article content to maximum 1500 words, preserving sentence boundaries when possible.
+        """
+        if not content:
+            self.logger.info("Original word count: 0, Truncated word count: 0")
+            return ""
+
+        words = content.split()
+        original_word_count = len(words)
+        if original_word_count <= 1500:
+            self.logger.info(f"Original word count: {original_word_count}, Truncated word count: {original_word_count} (no truncation needed)")
+            return content
+
+        # Try to find sentence boundaries using simple delimiters: '.', '!', '?'
+        sentences = re.split(r'(?<=[.!?])\s+', content)
+        
+        truncated_sentences = []
+        current_word_count = 0
+        
+        for sent in sentences:
+            sent_words = sent.split()
+            sent_word_count = len(sent_words)
+            if current_word_count + sent_word_count <= 1500:
+                truncated_sentences.append(sent)
+                current_word_count += sent_word_count
+            else:
+                # If adding this sentence exceeds 1500 words, stop.
+                if not truncated_sentences:
+                    truncated_words = sent_words[:1500]
+                    truncated_sentences.append(" ".join(truncated_words) + "...")
+                    current_word_count = 1500
+                break
+                
+        truncated_content = " ".join(truncated_sentences)
+        truncated_word_count = len(truncated_content.split())
+        self.logger.info(f"Original word count: {original_word_count}, Truncated word count: {truncated_word_count}")
+        return truncated_content
+
+    def _calculate_fallback_score(self, state: AgentState) -> int:
+        """
+        Calculates a heuristic fallback score based on quality-aware evidence metrics.
+        """
+        score = 20
+        
+        # Blindspots count contribution (+5 each, max +25)
+        num_blindspots = len(getattr(state, "blindspots", []))
+        score += min(num_blindspots * 5, 25)
+
+        # Contradicting evidence contribution (High: +8, Medium: +4, Low: +2)
+        contradicts_contrib = 0
+        for ev in getattr(state, "evidence", []):
+            rel = getattr(ev, "relevance", "").lower()
+            qual = getattr(ev, "quality", "").lower()
+            if "contradict" in rel:
+                if "high" in qual:
+                    contradicts_contrib += 8
+                elif "medium" in qual:
+                    contradicts_contrib += 4
+                else:
+                    contradicts_contrib += 2
+        score += contradicts_contrib
+
+        # Unique Source Types contribution (+3 each, max +12)
+        unique_source_types = set()
+        for ev in getattr(state, "evidence", []):
+            url = getattr(ev.search_result, "url", "")
+            unique_source_types.add(self._classify_source_type(url))
+            
+        # Filter out other
+        unique_source_types.discard("other")
+        score += min(len(unique_source_types) * 3, 12)
+
+        # Clamp between 0 and 100
+        clamped_score = max(0, min(100, score))
+        
+        self.logger.info(
+            f"Heuristic scoring fallback: base=20, blindspots={num_blindspots} (+{min(num_blindspots*5, 25)}), "
+            f"contradicts={contradicts_contrib}, source_types={len(unique_source_types)} (+{min(len(unique_source_types)*3, 12)}), "
+            f"final_score={clamped_score}"
+        )
+        return clamped_score
+
+    def _format_claims(self, state: AgentState) -> str:
+        """
+        Format claims section for the prompt.
+        """
+        if not state.claims or not state.claims.key_claims:
+            return "None."
+        return "\n".join(f"- {claim}" for claim in state.claims.key_claims)
+
+    def _format_blindspots(self, state: AgentState) -> str:
+        """
+        Format blindspots section for the prompt.
+        """
+        if not state.blindspots:
+            return "None."
+        return "\n".join(
+            f"- Category: {bs.category}\n  Description: {bs.description}"
+            for bs in state.blindspots
+        )
+
+    def _format_evidence(self, state: AgentState) -> str:
+        """
+        Format evidence section for the prompt.
+        """
+        if not state.evidence:
+            return "None."
+        return "\n".join(
+            f"- Relevance: {ev.relevance}\n  Insight: {ev.key_insight}"
+            for ev in state.evidence
+        )
+
+
+    def _format_metadata(self, state: AgentState) -> str:
+        """
+        Format metadata section for the prompt.
+        """
+        detailed_diversity = {
+            "academic": 0, "government": 0, "news": 0, "think_tank": 0,
+            "industry": 0, "social_media": 0, "blog": 0, "other": 0
+        }
+        for ev in state.evidence:
+            url = getattr(ev.search_result, "url", "")
+            cat = self._classify_source_type(url)
+            if cat in detailed_diversity:
+                detailed_diversity[cat] += 1
+            else:
+                detailed_diversity["other"] += 1
+
+        diversity_str = "\n".join(f"  * {cat.capitalize()}: {count}" for cat, count in detailed_diversity.items())
+        confidence = getattr(state, 'confidence_score', 0)
+        conf_label = self._get_confidence_label(confidence)
+
+        metadata_str = (
+            f"- Research Duration: {getattr(state, 'research_duration_seconds', 0)} seconds\n"
+            f"- Completion Reason: {getattr(state, 'completion_reason', 'unknown')}\n"
+            f"- Confidence Score: {confidence}/100 ({conf_label})\n"
+            f"- Search Metrics:\n"
+            f"  * Searches Executed: {state.metrics.get('searches_executed', 0)}\n"
+            f"  * Results Collected: {state.metrics.get('results_collected', 0)}\n"
+            f"  * Evidence Collected: {state.metrics.get('evidence_collected', 0)}\n"
+            f"- Source Diversity Summary:\n{diversity_str}"
+        )
+        return metadata_str
+
+    def _format_analytics(
+        self,
+        state: AgentState,
+        evidence_balance: dict,
+        quality_distribution: dict
+    ) -> str:
+        """
+        Format analytics section for the prompt.
+        """
+        analytics_str = (
+            f"- Evidence Balance (Supports vs Contradicts vs Adds Context):\n"
+            f"  * Supporting: {evidence_balance['supports']}\n"
+            f"  * Contradicting: {evidence_balance['contradicts']}\n"
+            f"  * Context-adding: {evidence_balance['adds_context']}\n"
+            f"- Source Quality distribution:\n"
+            f"  * High Quality: {quality_distribution['high']}\n"
+            f"  * Medium Quality: {quality_distribution['medium']}\n"
+            f"  * Low Quality: {quality_distribution['low']}"
+        )
+        return analytics_str
+
+    def _build_prompt(self, state: AgentState, heuristic_score: int, balance: dict, confidence: int) -> str:
+        """
+        Builds a simplified prompt layout containing ONLY the requested elements.
+        """
+        article_title = state.article.title
+        article_topic = state.claims.main_topic if state.claims else "Unknown"
+        
+        claims_str = self._format_claims(state)
+        blindspots_str = self._format_blindspots(state)
+        evidence_str = self._format_evidence(state)
+        analytics_str = f"Confidence Score: {confidence}%"
+
+        instructions = (
+            "You are a neutral media analyst. Output the final report JSON explaining the article's blindspots.\n"
+            "The blindspot_score (0-100) represents the amount of missing context in the article.\n"
+            "Be fair. Do NOT use terms like 'biased' or 'misleading'. Instead, use neutral terms like 'The available evidence suggests additional perspectives may exist.'\n"
+            "Your score_reasoning must be highly specific, referencing the actual key claims, identified blindspots, evidence, confidence, and coverage. Keep it under 50 words.\n"
+            "The balanced_conclusion MUST be 100-200 words and explicitly separate sections using clear headers/labels:\n"
+            "Original Framing: [Summary of the original framing/claims]\n"
+            "Supporting Evidence: [Details of gathered evidence that supports claims/context, or state None if none found]\n"
+            "Contradictory Evidence: [Details of gathered evidence that contradicts claims/framing, or state None if none found]\n"
+            "Missing Evidence: [Omissions and perspectives still missing from both article and current research]\n"
+            "Remaining Uncertainty: [What issues remain unverified due to research limitations]\n"
+            "Ensure the tone is objective, balanced, and strictly neutral."
+        )
+
+        schema = {
+            "blindspot_score": "refined integer score between 0 and 100 representing missing context volume and import",
+            "score_reasoning": "highly specific explanation referencing the key claims, detected blindspots, quality and count of gathered evidence, confidence score, and coverage",
+            "missing_categories": ["list of specific categories of omitted perspectives"],
+            "balanced_conclusion": "a synthesized conclusion (100-200 words) structured with these exact sections and headers:\nOriginal Framing: [content]\nSupporting Evidence: [content]\nContradictory Evidence: [content]\nMissing Evidence: [content]\nRemaining Uncertainty: [content]"
+        }
+
+        schema_str = json.dumps(schema, indent=2)
+
+        return (
+            f"System Instructions:\n{instructions}\n\n"
+            f"JSON Schema:\n{schema_str}\n\n"
+            f"Article:\n"
+            f"Title: {article_title}\n"
+            f"Topic: {article_topic}\n\n"
+            f"Claims:\n{claims_str}\n\n"
+            f"Blindspots:\n{blindspots_str}\n\n"
+            f"Evidence:\n{evidence_str}\n\n"
+            f"Analytics:\n{analytics_str}"
+        )
+
+    def make_conclusion_neutral(self, text: str, confidence_score: int) -> str:
+        """
+        Converts strong, accusatory statements in conclusion text to neutral, evidence-based statements.
+        Appends uncertainty caveats if confidence is under 30.
+        """
+        # Case-insensitive replacements for "biased" or "misleading" statements
+        text = re.sub(r'\bthe article is biased\b', 'The available evidence suggests additional perspectives may exist.', text, flags=re.IGNORECASE)
+        text = re.sub(r'\bthe article is misleading\b', 'The available evidence suggests additional perspectives may exist.', text, flags=re.IGNORECASE)
+        text = re.sub(r'\bbiased\b', 'focused on specific perspectives', text, flags=re.IGNORECASE)
+        text = re.sub(r'\bmisleading\b', 'omits some context', text, flags=re.IGNORECASE)
+        
+        # Soften other terms
+        replacements = [
+            (r'\bfails to address\b', 'does not appear to discuss'),
+            (r'\bfail to address\b', 'do not appear to discuss'),
+            (r'\blacks\b', 'does not appear to discuss'),
+            (r'\black\b', 'do not appear to discuss'),
+            (r'\bomitted key\b', 'may have excluded additional'),
+            (r'\bcompletely lacks\b', 'exhibits limited coverage of'),
+            (r'\bfails to\b', 'does not fully'),
+            (r'\bfail to\b', 'do not fully'),
+            (r'\bnot balanced\b', 'focused on specific perspectives'),
+            (r'\bunsubstantiated\b', 'not fully verified by available evidence'),
+            (r'\bis false\b', 'is not conclusively proven by available evidence'),
+            (r'\bis incorrect\b', 'may lack supporting evidence in secondary sources'),
+            (r'\bcompletely wrong\b', 'not fully verified'),
+            (r'\bwrong\b', 'lacking consensus'),
+            (r'\blies\b', 'unverified assertions'),
+            (r'\blie\b', 'unverified assertion')
+        ]
+        
+        for pattern, repl in replacements:
+            text = re.sub(pattern, repl, text, flags=re.IGNORECASE)
+            
+        # Ensure we always include: "The available evidence suggests additional perspectives may exist."
+        if "The available evidence suggests additional perspectives may exist." not in text:
+            if not text.endswith(" "):
+                text += " "
+            text += "The available evidence suggests additional perspectives may exist."
+            
+        # When confidence < 30: append the caveat
+        if confidence_score < 30:
+            if not text.endswith(" "):
+                text += " "
+            suffix = "These findings should be considered preliminary. Additional evidence would be needed before drawing strong conclusions."
+            if suffix not in text:
+                text += suffix
+                
+        return text
+
+    def _validate_report_response(self, response: dict, confidence_score: int = 0, heuristic_score: int = 50) -> dict:
+        """
+        Validates the raw LLM response dictionary, applies safe defaults, logs warnings
+        on discrepancies, and automatically appends confidence-aware caveats.
+        """
+        validated = {}
+
+        # 1. Validate blindspot_score
+        score = response.get("blindspot_score")
+        if not isinstance(score, int):
+            try:
+                score = int(score)
+            except (ValueError, TypeError):
+                self.logger.warning(f"Invalid blindspot_score '{score}' received; falling back to heuristic: {heuristic_score}")
+                score = heuristic_score
+        validated["blindspot_score"] = max(0, min(100, score))
+
+        # 2. Validate score_reasoning
+        score_reasoning = response.get("score_reasoning")
+        if not isinstance(score_reasoning, str) or not score_reasoning.strip():
+            self.logger.warning("Empty or invalid score_reasoning received, using default fallback.")
+            validated["score_reasoning"] = f"Assigned based on heuristic score reference ({heuristic_score}) refined by evidence metrics."
+        else:
+            validated["score_reasoning"] = score_reasoning.strip()
+
+        # 3. Validate missing_categories
+        missing_categories = response.get("missing_categories")
+        if not isinstance(missing_categories, list):
+            self.logger.warning("Invalid missing_categories received, using default empty list.")
+            validated["missing_categories"] = []
+        else:
+            validated["missing_categories"] = [str(c).strip() for c in missing_categories if c]
+
+        # 4. Validate balanced_conclusion
+        balanced_conclusion = response.get("balanced_conclusion")
+        if not isinstance(balanced_conclusion, str) or not balanced_conclusion.strip():
+            self.logger.warning("Empty or invalid balanced_conclusion received, using default fallback.")
+            balanced_conclusion = (
+                "Based on the gathered evidence, the original article may have omitted additional context. "
+                "Introducing these external sources helps construct a more comprehensive and balanced overview of the topic."
+            )
+        else:
+            balanced_conclusion = balanced_conclusion.strip()
+
+        # Force balanced, neutral language
+        balanced_conclusion = self.make_conclusion_neutral(balanced_conclusion, confidence_score)
+
+        validated["balanced_conclusion"] = balanced_conclusion
+        return validated
+
+    def calibrate_blindspot_score(
+        self,
+        score: int,
+        confidence: int,
+        evidence_count: int,
+        blindspot_count: int,
+        coverage: float = 0.0
+    ) -> int:
+        """
+        Calibrates the blindspot score according to confidence bands, evidence counts,
+        missing context ranges, and safety limits.
+        """
+        calibrated = score
+
+        # 1. Base limits/caps based on confidence levels
+        if confidence < 20:
+            calibrated = min(calibrated, 30)
+        elif confidence < 30:
+            calibrated = min(calibrated, 40)
+        elif confidence < 50:
+            calibrated = min(calibrated, 60)
+
+        # 2. Specific user limits
+        if confidence > 40:
+            # blindspot_score between 30 and 70
+            calibrated = max(30, min(70, calibrated))
+        elif blindspot_count >= 2 and confidence == 0:
+            # blindspot_score between 20 and 30
+            calibrated = max(20, min(30, calibrated))
+        elif confidence <= 40:
+            # Standard cap for lower confidence
+            calibrated = min(calibrated, confidence + 5)
+
+        if evidence_count == 0:
+            # if evidence_count == 0: blindspot_score >= 15
+            calibrated = max(calibrated, 15)
+
+        # Apply missing context ranges (Issue 9):
+        # - 0-20: Well-rounded article (0 blindspots)
+        # - 20-40: Minor missing context (1-2 blindspots, covered)
+        # - 40-60: Moderate missing context (2-3 blindspots, partially covered)
+        # - 60-80: Significant missing context (3 blindspots, low coverage)
+        # - 80-100: Major perspective gaps (3+ blindspots, zero coverage)
+        
+        if blindspot_count == 0:
+            range_min, range_max = 0, 20
+            range_reason = "0 blindspots (well-rounded article)"
+        elif blindspot_count in (1, 2):
+            if coverage >= 0.5:
+                range_min, range_max = 20, 40
+                range_reason = "1-2 blindspots, covered (minor missing context)"
+            else:
+                range_min, range_max = 40, 60
+                range_reason = "1-2 blindspots, low coverage (moderate missing context)"
+        else:  # blindspot_count >= 3
+            if coverage == 0.0 or evidence_count == 0:
+                range_min, range_max = 80, 100
+                range_reason = "3+ blindspots, zero coverage (major perspective gaps)"
+            elif coverage <= 0.35:
+                range_min, range_max = 60, 80
+                range_reason = "3+ blindspots, low coverage (significant missing context)"
+            else:
+                range_min, range_max = 40, 60
+                range_reason = "3+ blindspots, moderate coverage (moderate missing context)"
+
+        calibrated = max(range_min, min(range_max, calibrated))
+
+        # Avoid 0, 5, 100 unless explicitly justified (clamping scores 15-95)
+        if calibrated <= 5:
+            calibrated = 15
+        elif calibrated >= 100:
+            calibrated = 95
+
+        # Strictly guarantee min 15
+        calibrated = max(15, calibrated)
+
+        self.logger.info(
+            f"Blindspot score reasoning: raw score {score} calibrated to {calibrated} "
+            f"within range [{range_min}-{range_max}] based on: {range_reason}. "
+            f"Inputs: confidence={confidence}, evidence_count={evidence_count}, blindspots={blindspot_count}, coverage={coverage:.2f}"
+        )
+
+        return calibrated
+
+    def generate_programmatic_report(
+        self,
+        topic: str,
+        claims: Any,
+        blindspots: List[Blindspot],
+        evidence: List[Evidence],
+        confidence: int,
+        coverage: float
+    ) -> dict:
+        """
+        Builds reasoning, missing categories, balanced conclusion, and blindspot score
+        programmatically without any LLM calls.
+        """
+        if hasattr(claims, "key_claims"):
+            key_claims_list = claims.key_claims
+            framing_summary = getattr(claims, "framing_summary", "")
+        elif isinstance(claims, list):
+            key_claims_list = claims
+            framing_summary = ""
+        else:
+            key_claims_list = []
+            framing_summary = ""
+
+        num_blindspots = len(blindspots) if blindspots else 0
+        evidence_count = len(evidence) if evidence else 0
+        claims_count = len(key_claims_list)
+
+        # Build highly specific reasonings using actual claims and blindspots
+        claims_summary = ", ".join(f"'{c}'" for c in key_claims_list[:2]) if key_claims_list else "the article claims"
+        blindspots_summary = ", ".join(f"'{b.category}'" for b in blindspots[:2]) if blindspots else "omitted categories"
+        
+        score_reasoning_str = (
+            f"The analysis for the topic '{topic}' evaluated key assertions such as {claims_summary}. "
+            f"However, with a research confidence of {confidence}%, there are notable missing perspectives regarding {blindspots_summary}. "
+            f"A total of {evidence_count} evidence items were collected to address these omissions."
+        )
+
+        # Re-calculate heuristic fallback score offline
+        score = 20
+        score += min(num_blindspots * 5, 25)
+
+        contradicts_contrib = 0
+        for ev in (evidence or []):
+            rel = getattr(ev, "relevance", "").lower()
+            qual = getattr(ev, "quality", "").lower()
+            if "contradict" in rel:
+                if "high" in qual:
+                    contradicts_contrib += 8
+                elif "medium" in qual:
+                    contradicts_contrib += 4
+                else:
+                    contradicts_contrib += 2
+        score += contradicts_contrib
+
+        unique_source_types = set()
+        for ev in (evidence or []):
+            url = getattr(ev.search_result, "url", "")
+            unique_source_types.add(self._classify_source_type(url))
+        unique_source_types.discard("other")
+        score += min(len(unique_source_types) * 3, 12)
+        heuristic_score = max(0, min(100, score))
+
+        # Dynamic Balanced Conclusion construction (explicitly separated sections)
+        original_framing = framing_summary if (framing_summary and framing_summary != "Unknown") else "the main topic claims"
+        
+        # Supporting vs Contradictory evidence
+        supporting_insights = []
+        contradictory_insights = []
+        context_insights = []
+        for ev in (evidence or []):
+            insight = ev.key_insight.strip().rstrip(".")
+            rel = getattr(ev, "relevance", "Adds Context").lower()
+            if "support" in rel:
+                supporting_insights.append(insight)
+            elif "contradict" in rel:
+                contradictory_insights.append(insight)
+            else:
+                context_insights.append(insight)
+
+        # Build each section
+        orig_section = f"Original Framing: The article focused primarily on {original_framing.strip().rstrip('.')}, presenting assertions that outline the core policy details and intended goals."
+        
+        supp_text = "; and ".join(supporting_insights[:2]) if supporting_insights else ""
+        if not supp_text and context_insights:
+            supp_text = "; and ".join(context_insights[:2]) + " (contextual)"
+        supp_section = f"Supporting Evidence: {supp_text if supp_text else 'None'}"
+        
+        contr_text = "; and ".join(contradictory_insights[:2]) if contradictory_insights else ""
+        contr_section = f"Contradictory Evidence: {contr_text if contr_text else 'None'}"
+        
+        missing_cats = [bs.category for bs in blindspots] if blindspots else ["Alternative Perspectives"]
+        missing_desc = [bs.description.strip().rstrip('.') for bs in blindspots] if blindspots else []
+        if missing_desc:
+            miss_text = f"The analysis identified several underrepresented blindspots or missing perspectives, specifically covering categories like {', '.join(missing_cats[:2])}, which involve {'; and '.join(missing_desc[:2])}."
+        else:
+            miss_text = f"The analysis identified underrepresented blindspots, specifically concerning {', '.join(missing_cats[:2])} which were not addressed in the primary text."
+        miss_section = f"Missing Evidence: {miss_text}"
+        
+        # Remaining uncertainty
+        unc_text = f"Aspects regarding {', '.join(missing_cats[:2])} remain unverified and require further investigation due to research limitations."
+        unc_section = f"Remaining Uncertainty: {unc_text}"
+        
+        balanced_conclusion = "\n".join([
+            orig_section,
+            supp_section,
+            contr_section,
+            miss_section,
+            unc_section
+        ])
+        balanced_conclusion = self.make_conclusion_neutral(balanced_conclusion, confidence)
+
+        missing_cats = [bs.category for bs in blindspots] if blindspots else ["Alternative Perspectives"]
+
+        # Run calibration on programmatic score
+        calibrated_score = self.calibrate_blindspot_score(
+            heuristic_score,
+            confidence,
+            evidence_count,
+            num_blindspots,
+            coverage
+        )
+
+        return {
+            "blindspot_score": calibrated_score,
+            "score_reasoning": score_reasoning_str,
+            "missing_categories": missing_cats,
+            "balanced_conclusion": balanced_conclusion
+        }
+
+    def generate(self, state: AgentState) -> BlindspotReport:
+        """
+        Generates the BlindspotReport, validates, and stores a JSON file containing metadata.
+        """
+        # Validate inputs first
+        is_restricted = getattr(state.article, "access_restricted", False)
+        has_invalid_claims = not state.claims or not state.claims.main_topic or state.claims.main_topic == "Unknown"
+        is_invalid = is_restricted or has_invalid_claims
+        
+        if is_invalid:
+            self.logger.warning(f"Generating programmatic fallback report due to restriction/invalid inputs (restricted={is_restricted}, invalid_claims={has_invalid_claims})")
+            reason = "Publisher restriction" if is_restricted else "Invalid claims or topic"
+            reasoning_text = f"Article content could not be accessed. Reason: {reason}. Analysis limited to metadata."
+            
+            report = BlindspotReport(
+                article_title=state.article.title or "Unknown Title",
+                article_url=state.article.url or "",
+                analysis_timestamp=datetime.now(timezone.utc).isoformat(),
+                main_topic=state.claims.main_topic if state.claims else "Unknown",
+                key_claims=state.claims.key_claims if state.claims else [],
+                blindspots=[],
+                evidence_count=0,
+                blindspot_score=25,
+                score_reasoning=reasoning_text,
+                missing_categories=["General Context"],
+                balanced_conclusion=reasoning_text,
+                search_attempts=0,
+                confidence_score=0,
+                confidence_label="Low Confidence",
+                evidence_strength="Weak",
+                completion_reason=state.completion_reason or "access_restricted",
+                research_duration=0,
+                source_diversity={},
+                report_version=REPORT_VERSION,
+                search_metrics={},
+                evidence_balance={},
+                quality_distribution={},
+                query_history={},
+                phase_timestamps=getattr(state, "phase_timestamps", {}),
+                blindspot_coverage={}
+            )
+            
+            # Save it to disk as well
+            self._save_report_to_disk(report, state)
+            return report
+
+        confidence = getattr(state, "confidence_score", 0)
+        conf_label = self._get_confidence_label(confidence)
+        self.logger.info(f"Generating report. Research confidence: {confidence}% ({conf_label})")
+
+        # Derive evidence_strength based on confidence (Phase 10 rules)
+        if confidence < 30:
+            evidence_strength = "Weak"
+        elif confidence < 60:
+            evidence_strength = "Moderate"
+        else:
+            evidence_strength = "Strong"
+
+        balance = {"supports": 0, "contradicts": 0, "adds_context": 0}
+        quality_dist = {"high": 0, "medium": 0, "low": 0}
+        heuristic_score = 40
+        score = 40
+        validated = {}
+
+        try:
+            # 1. Analytics and Heuristics
+            balance = self._calculate_evidence_balance(state.evidence)
+            quality_dist = self._calculate_quality_distribution(state.evidence)
+            heuristic_score = self._calculate_fallback_score(state)
+            article_topic = state.claims.main_topic if state.claims else "Unknown"
+
+            coverage = 0.0
+            if getattr(state, "confidence_details", None):
+                coverage = state.confidence_details.get("effective_coverage", 0.0)
+                if coverage == 0.0:
+                    coverage = state.confidence_details.get("coverage_ratio", 0.0)
+
+            # Check programmatic trigger conditions
+            llm_failures = getattr(state, "llm_failures", 0)
+            use_programmatic = (
+                confidence == 0 or
+                llm_failures > 0 or
+                not self.ollama_client.pre_call_health_check(self.ollama_client.model)
+            )
+
+            if use_programmatic:
+                self.logger.info(f"Triggering programmatic report generation (confidence={confidence}, llm_failures={llm_failures})")
+                validated = self.generate_programmatic_report(
+                    topic=article_topic,
+                    claims=state.claims,
+                    blindspots=state.blindspots or [],
+                    evidence=state.evidence or [],
+                    confidence=confidence,
+                    coverage=coverage
+                )
+                score = validated["blindspot_score"]
+            else:
+                # 2. Build Prompts
+                system_prompt = "/no_think\n\nReturn ONLY valid JSON."
+                user_prompt = self._build_prompt(state, heuristic_score, balance, confidence)
+
+                # Call LLM with num_predict=512
+                response = {}
+                try:
+                    response = self.ollama_client.generate_json_with_retry(
+                        prompt=user_prompt,
+                        system_prompt=system_prompt,
+                        temperature=0.2,
+                        num_predict=512,
+                        timeout=60.0
+                    )
+                    self.logger.info("LLM report received")
+                except Exception as e:
+                    self.logger.error(f"Failed to generate report from LLM, using fallbacks: {e}")
+
+                # 4. Fallback if response is invalid or empty
+                if not response or not isinstance(response, dict) or response == {}:
+                    self.logger.warning("LLM report generation failed or returned empty. Using programmatic generator.")
+                    validated = self.generate_programmatic_report(
+                        topic=article_topic,
+                        claims=state.claims,
+                        blindspots=state.blindspots or [],
+                        evidence=state.evidence or [],
+                        confidence=confidence,
+                        coverage=coverage
+                    )
+                else:
+                    # 5. Report Quality Validation
+                    validated = self._validate_report_response(response, confidence_score=confidence, heuristic_score=heuristic_score)
+                    
+                    # Ensure all required headers are present in the conclusion
+                    required_headers = [
+                        "Original Framing",
+                        "Supporting Evidence",
+                        "Contradictory Evidence",
+                        "Missing Evidence",
+                        "Remaining Uncertainty"
+                    ]
+                    conclusion_lower = validated.get("balanced_conclusion", "").lower()
+                    has_headers = all(h.lower() in conclusion_lower for h in required_headers)
+                    if not has_headers:
+                        self.logger.warning("LLM balanced_conclusion is missing required section headers. Substituting with programmatic conclusion fallback.")
+                        prog_report = self.generate_programmatic_report(
+                            topic=article_topic,
+                            claims=state.claims,
+                            blindspots=state.blindspots or [],
+                            evidence=state.evidence or [],
+                            confidence=confidence,
+                            coverage=coverage
+                        )
+                        validated["balanced_conclusion"] = prog_report["balanced_conclusion"]
+                
+                score = validated["blindspot_score"]
+                self.logger.info("Report validated")
+
+        except Exception as outer_e:
+            self.logger.error(f"Error during report calculation/generation steps: {outer_e}. Generating safe fallback report.", exc_info=True)
+            topic = getattr(getattr(state, "claims", None), "main_topic", "Unknown")
+            claims = getattr(state, "claims", [])
+            blindspots = getattr(state, "blindspots", [])
+            evidence = getattr(state, "evidence", [])
+            coverage = 0.0
+            if getattr(state, "confidence_details", None):
+                coverage = state.confidence_details.get("effective_coverage", 0.0)
+                if coverage == 0.0:
+                    coverage = state.confidence_details.get("coverage_ratio", 0.0)
+            validated = self.generate_programmatic_report(
+                topic=topic,
+                claims=claims,
+                blindspots=blindspots,
+                evidence=evidence,
+                confidence=confidence,
+                coverage=coverage
+            )
+            score = validated["blindspot_score"]
+
+        # Run calibration on final score
+        evidence_count = len(state.evidence) if getattr(state, "evidence", None) else 0
+        blindspot_count = len(state.blindspots) if getattr(state, "blindspots", None) else 0
+        
+        final_coverage = 0.0
+        if getattr(state, "confidence_details", None):
+            final_coverage = state.confidence_details.get("effective_coverage", 0.0)
+            if final_coverage == 0.0:
+                final_coverage = state.confidence_details.get("coverage_ratio", 0.0)
+                
+        score = self.calibrate_blindspot_score(score, confidence, evidence_count, blindspot_count, final_coverage)
+
+        # 5. Build Final BlindspotReport Model
+        try:
+            report = BlindspotReport(
+                article_title=state.article.title,
+                article_url=state.article.url,
+                analysis_timestamp=datetime.now(timezone.utc).isoformat(),
+                main_topic=state.claims.main_topic if state.claims else "Unknown",
+                key_claims=state.claims.key_claims if state.claims else [],
+                blindspots=state.blindspots,
+                evidence_count=len(state.evidence),
+                blindspot_score=score,
+                score_reasoning=validated.get("score_reasoning", "Fallback reasoning"),
+                missing_categories=validated.get("missing_categories", ["Alternative Perspectives"]),
+                balanced_conclusion=validated.get("balanced_conclusion", "Fallback conclusion"),
+                search_attempts=state.search_attempts,
+                confidence_score=confidence,
+                confidence_label=conf_label,
+                evidence_strength=evidence_strength,
+                completion_reason=state.completion_reason,
+                research_duration=state.research_duration_seconds,
+                source_diversity=state.source_diversity,
+                # Enhanced fields:
+                report_version=REPORT_VERSION,
+                search_metrics=state.metrics,
+                evidence_balance=balance,
+                quality_distribution=quality_dist,
+                query_history=getattr(state, "query_history", {}),
+                phase_timestamps=getattr(state, "phase_timestamps", {}),
+                blindspot_coverage=getattr(state, "blindspot_coverage", {})
+            )
+        except Exception as model_e:
+            self.logger.error(f"Failed to instantiate BlindspotReport model: {model_e}", exc_info=True)
+            report = BlindspotReport(
+                article_title=getattr(getattr(state, "article", None), "title", "Unknown"),
+                article_url=getattr(getattr(state, "article", None), "url", ""),
+                analysis_timestamp=datetime.now(timezone.utc).isoformat(),
+                main_topic=getattr(getattr(state, "claims", None), "main_topic", "Unknown"),
+                key_claims=getattr(getattr(state, "claims", None), "key_claims", []),
+                blindspots=getattr(state, "blindspots", []),
+                evidence_count=len(getattr(state, "evidence", [])),
+                blindspot_score=40,
+                score_reasoning="Critical fallback reasoning due to model initialization failure.",
+                missing_categories=["Alternative Perspectives"],
+                balanced_conclusion="Critical fallback conclusion due to model initialization failure.",
+                search_attempts=getattr(state, "search_attempts", 0),
+                confidence_score=confidence,
+                confidence_label=conf_label,
+                evidence_strength=evidence_strength,
+                completion_reason=getattr(state, "completion_reason", "error"),
+                research_duration=getattr(state, "research_duration_seconds", 0),
+                source_diversity=getattr(state, "source_diversity", {}),
+                report_version=REPORT_VERSION,
+                search_metrics=getattr(state, "metrics", {}),
+                evidence_balance=balance,
+                quality_distribution=quality_dist
+            )
+
+        self._save_report_to_disk(report, state)
+        return report
+
+    def _save_report_to_disk(self, report: BlindspotReport, state: AgentState) -> None:
+        """
+        Saves the report to a JSON file in the reports directory.
+        """
+        try:
+            confidence = report.confidence_score
+            conf_label = report.confidence_label
+            evidence_strength = report.evidence_strength
+            
+            report_summary = {
+                "blindspots_found": len(getattr(state, "blindspots", [])),
+                "evidence_items": len(getattr(state, "evidence", [])),
+                "search_attempts": getattr(state, "search_attempts", 0),
+                "confidence_score": confidence
+            }
+            
+            credibility_breakdown = {
+                "academic": 0, "government": 0, "news": 0, "think_tank": 0,
+                "industry": 0, "blog": 0, "social_media": 0, "other": 0
+            }
+            for ev in getattr(state, "evidence", []):
+                url = getattr(ev.search_result, "url", "")
+                cat = self._classify_source_type(url)
+                if cat in credibility_breakdown:
+                    credibility_breakdown[cat] += 1
+                else:
+                    credibility_breakdown["other"] += 1
+
+            timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+            title_str = report.article_title or "Unknown"
+            safe_title = "".join(c for c in title_str if c.isalnum() or c in (" ", "_", "-")).strip()
+            safe_title = safe_title.replace(" ", "_")[:50]
+            filename = f"report_{safe_title}_{timestamp}.json"
+
+            reports_dir = Path(self.config.REPORTS_DIR)
+            reports_dir.mkdir(parents=True, exist_ok=True)
+            filepath = reports_dir / filename
+
+            json_data = {
+                "report": report.model_dump(),
+                "metadata": {
+                    "generated_at": datetime.now(timezone.utc).isoformat(),
+                    "confidence_score": confidence,
+                    "confidence_label": conf_label,
+                    "evidence_strength": evidence_strength,
+                    "completion_reason": getattr(state, "completion_reason", ""),
+                    "research_duration_seconds": getattr(state, "research_duration_seconds", 0),
+                    "source_diversity": getattr(state, "source_diversity", {}),
+                    "metrics": getattr(state, "metrics", {}),
+                    "report_summary": report_summary,
+                    "report_version": REPORT_VERSION,
+                    "search_queries_used": getattr(state, "search_queries_used", []),
+                    "evidence": [ev.model_dump() for ev in getattr(state, "evidence", [])],
+                    "blindspots": [bs.model_dump() for bs in getattr(state, "blindspots", [])],
+                    "phase_timestamps": getattr(state, "phase_timestamps", {}),
+                    "blindspot_coverage": getattr(state, "blindspot_coverage", {}),
+                    "query_history": getattr(state, "query_history", {}),
+                    "search_metrics": getattr(state, "metrics", {}),
+                    "evidence_balance": report.evidence_balance,
+                    "quality_distribution": report.quality_distribution,
+                    "raw_search_results": [res.model_dump() for res in getattr(state, "search_results", [])],
+                    "planner_decisions": [
+                        dec.model_dump() if hasattr(dec, "model_dump") else dec 
+                        for dec in getattr(state, "planner_decisions", [])
+                    ],
+                    "source_credibility_breakdown": credibility_breakdown
+                }
+            }
+
+            with open(filepath, "w", encoding="utf-8") as f:
+                json.dump(json_data, f, indent=2, ensure_ascii=False)
+            self.logger.info(f"Report saved to: {filepath}")
+        except Exception as e:
+            self.logger.error(f"Failed to write report to disk: {e}")
+
+
+if __name__ == "__main__":
+    import sys
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
+
+    try:
+        from models.data_models import ArticleData, ClaimAnalysis, Blindspot, SearchResult, Evidence
+        config = Config.from_env()
+        client = OllamaClient(config)
+        rg = ReportGenerator(client, config)
+
+        # 1. Create ArticleData
+        article = ArticleData(
+            url="https://example.com/mock-article",
+            title="Mock Article on Renewable Energy",
+            author="John Doe",
+            publication_date="2026-06-17",
+            content="Renewable energy is growing. Solar and wind power are the future. Solar panels are cheap."
+        )
+
+        # 2. Create ClaimAnalysis
+        claims = ClaimAnalysis(
+            main_topic="Renewable Energy Growth",
+            key_claims=["Solar power is growing", "Wind power is the future"],
+            author_stance="Pro-renewables",
+            tone="Informative",
+            framing_summary="Focuses on growth and benefits of solar/wind power."
+        )
+
+        # 3. Create 2 Blindspots
+        bs1 = Blindspot(
+            category="Grid Reliability",
+            description="Omitted discussion on grid instability due to intermittent solar/wind supply.",
+            importance="High",
+            suggested_search_query="grid reliability intermittent renewable energy solar wind"
+        )
+        bs2 = Blindspot(
+            category="Rare Earth Metals Cost",
+            description="No mention of rare earth metals mining costs and environmental impact.",
+            importance="Medium",
+            suggested_search_query="rare earth metals environmental cost solar panels wind turbines"
+        )
+
+        # 4. Create 2 SearchResults
+        res1 = SearchResult(
+            query="grid reliability intermittent renewable energy solar wind",
+            title="Managing Grid Reliability with High Renewable Penetration",
+            url="https://example.gov/grid-reliability",
+            snippet="DOE report showing that grid updates are critical to manage intermittency."
+        )
+        res2 = SearchResult(
+            query="rare earth metals environmental cost solar panels wind turbines",
+            title="The Environmental Footprint of Green Energy Technologies",
+            url="https://example.edu/environmental-footprint",
+            snippet="Academic study highlighting mining impacts for lithium, cobalt, and rare earth metals."
+        )
+
+        # 5. Create 2 Evidence objects
+        ev1 = Evidence(
+            search_result=res1,
+            relevance="Adds Context",
+            quality="High",
+            key_insight="Grid adjustments are necessary to prevent outages when solar/wind are intermittent."
+        )
+        ev2 = Evidence(
+            search_result=res2,
+            relevance="Contradicts",
+            quality="High",
+            key_insight="Rare earth metals mining creates major ecological hazards not mentioned in clean energy pieces."
+        )
+
+        # 6. Create Full AgentState
+        state = AgentState(
+            article=article,
+            claims=claims,
+            blindspots=[bs1, bs2],
+            evidence=[ev1, ev2],
+            search_attempts=1,
+            confidence_score=25,  # Selected under 30 to verify the warning caveat appends
+            search_queries_used=["grid reliability intermittent renewable energy solar wind", "rare earth metals environmental cost solar panels wind turbines"],
+            status="generating_report",
+            search_results=[res1, res2],
+            metrics={"searches_executed": 2, "results_collected": 2, "evidence_collected": 2},
+            source_diversity={"unique_domains": 2, "government": 1, "academic": 1},
+            research_duration_seconds=120,
+            completion_reason="confidence_threshold_reached",
+            phase_timestamps={"article_extraction": "2026-06-17T10:00:00Z", "analysis_complete": "2026-06-17T10:02:00Z"},
+            query_history={"grid reliability intermittent renewable energy solar wind": ["https://example.gov/grid-reliability"], "rare earth metals environmental cost solar panels wind turbines": ["https://example.edu/environmental-footprint"]},
+            blindspot_coverage={"Grid Reliability": "partial", "Rare Earth Metals Cost": "partial"}
+        )
+
+        print("==================================================")
+        print("GENERATING REPORT FROM MOCK STATE")
+        print("==================================================")
+        report = rg.generate(state)
+
+        print("\n" + "=" * 60)
+        print("VERIFICATION RESULTS")
+        print("=" * 60)
+        print(f"Article Title:      {report.article_title}")
+        print(f"Blindspot Score:    {report.blindspot_score}/100")
+        print(f"Confidence Score:   {report.confidence_score}% ({report.confidence_label})")
+        print(f"Missing Categories: {report.missing_categories}")
+        print(f"Conclusion:\n{report.balanced_conclusion}")
+        print("-" * 60)
+
+        # Check if file exists
+        reports_dir = Path(config.REPORTS_DIR)
+        saved_files = list(reports_dir.glob("report_*.json"))
+        if saved_files:
+            latest_file = max(saved_files, key=lambda p: p.stat().st_mtime)
+            print(f"Saved JSON Path:    {latest_file.resolve()}")
+            assert latest_file.exists(), "Saved report file does not exist!"
+            print("Verification: SUCCESS (Report file successfully created on disk).")
+        else:
+            print("Verification: FAILED (No report file found in reports directory).")
+
+    except Exception as e:
+        print(f"Error during ReportGenerator testing: {e}")
+        import traceback
+        traceback.print_exc()

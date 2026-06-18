@@ -2,7 +2,7 @@ import logging
 
 def get_logger(name: str) -> logging.Logger:
     logger = logging.getLogger(name)
-    logger.setLevel(logging.DEBUG)
+    logger.setLevel(logging.INFO)
     
     # Check if the logger already has handlers to prevent duplicates
     if not logger.handlers:

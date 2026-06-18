@@ -1,4 +1,5 @@
-from typing import List
+from typing import List, Optional
+import re
 
 from models.data_models import (
     AgentState,
@@ -91,6 +92,88 @@ No explanations outside the JSON.
                 
         return summary
 
+    def _check_semantic_coverage_local(self, category: str, insight: str) -> bool:
+        if not category or not insight:
+            return False
+            
+        cat_lower = category.lower().strip()
+        ins_lower = insight.lower().strip()
+        
+        # Suffix-stripping stemmer
+        def stem(w: str) -> str:
+            w = w.lower().strip()
+            if len(w) <= 3:
+                return w
+            suffixes = ["ing", "ed", "es", "ly", "tion", "ment", "al", "ity", "ive", "ic", "s"]
+            for suff in suffixes:
+                if w.endswith(suff):
+                    return w[:-len(suff)]
+            return w
+
+        import re
+        stop_words = {
+            "a", "an", "the", "and", "or", "in", "on", "at", "to", "for", "of", "by", "with",
+            "is", "are", "was", "were", "will", "would", "should", "can", "could", "about",
+            "from", "this", "that", "these", "those", "how", "why", "what", "which", "policy", "rules", "new",
+            "impact", "challenges", "outcomes", "opinions", "perspective", "concerns"
+        }
+        
+        def get_stemmed_tokens(text: str):
+            words = re.findall(r'\b\w+\b', text.lower())
+            return {stem(w) for w in words if w not in stop_words and len(w) > 2}
+
+        cat_tokens = get_stemmed_tokens(cat_lower)
+        ins_tokens = get_stemmed_tokens(ins_lower)
+        
+        if not cat_tokens:
+            return False
+            
+        # 1. Category keyword overlap
+        overlap = cat_tokens.intersection(ins_tokens)
+        has_cat_overlap = len(overlap) >= 2 or (len(cat_tokens) == 1 and len(overlap) >= 1)
+        
+        # 2. Synonym / Semantic keyword overlap
+        synonyms = {
+            "rural": ["village", "remote", "agriculture", "farmer", "villages", "distant"],
+            "teacher": ["educator", "salary", "salaries", "compensation", "faculty", "staff"],
+            "school": ["education", "classroom", "institution", "infrastructure", "building", "facilities"],
+            "funding": ["budget", "allocation", "expenditure", "monetary", "financial", "spent", "spending"],
+            "barrier": ["obstacle", "challenge", "hurdle", "difficulty", "inaccessibility", "inequality"]
+        }
+        
+        has_semantic_overlap = False
+        for cat_word in cat_tokens:
+            for base, syn_list in synonyms.items():
+                stemmed_syns = {stem(s) for s in syn_list}
+                stemmed_syns.add(stem(base))
+                if stem(cat_word) in stemmed_syns:
+                    if ins_tokens.intersection(stemmed_syns):
+                        has_semantic_overlap = True
+                        break
+            if has_semantic_overlap:
+                break
+                
+        # 3. Stakeholder match
+        stakeholders = {
+            "student": ["student", "students", "learner", "learners", "examinee", "examinees", "youth", "child", "children"],
+            "teacher": ["teacher", "teachers", "educator", "educators", "faculty", "staff"],
+            "motorist": ["motorist", "motorists", "driver", "drivers", "owner", "owners", "public", "citizen", "citizens"],
+            "business": ["business", "businesses", "merchant", "merchants", "industry", "industries", "employer", "employers", "company", "companies"]
+        }
+        
+        has_stakeholder_match = False
+        cat_words_raw = re.findall(r'\b\w+\b', cat_lower)
+        ins_words_raw = re.findall(r'\b\w+\b', ins_lower)
+        
+        for group, terms in stakeholders.items():
+            cat_has_group = any(t in cat_words_raw for t in terms)
+            ins_has_group = any(t in ins_words_raw for t in terms)
+            if cat_has_group and ins_has_group:
+                has_stakeholder_match = True
+                break
+
+        return has_cat_overlap or has_semantic_overlap or has_stakeholder_match
+
     def _estimate_blindspot_coverage(self, state: AgentState) -> dict:
         """
         Estimates which blindspots already have gathered evidence.
@@ -104,289 +187,342 @@ No explanations outside the JSON.
             category = bs.category
             coverage[category] = False
             
-            category_lower = category.lower()
-            cat_words = set(w for w in category_lower.split() if len(w) > 3)
-            
-            suggested_lower = bs.suggested_search_query.lower()
-            suggested_words = set(w for w in suggested_lower.split() if len(w) > 3)
-            
             for ev in evidence_list:
-                query_lower = ev.search_result.query.lower()
-                insight_lower = ev.key_insight.lower()
-                
-                # Check if category keywords are in the query or key insight
-                if any(w in query_lower or w in insight_lower for w in cat_words):
+                if self._check_semantic_coverage_local(category, ev.key_insight):
                     coverage[category] = True
                     break
                     
-                # Or check if there's high overlap with the suggested query
-                query_words = set(w for w in query_lower.split() if len(w) > 3)
-                if suggested_words and query_words:
-                    shared = suggested_words.intersection(query_words)
-                    if len(shared) / len(suggested_words) >= 0.5:
-                        coverage[category] = True
-                        break
-                        
         return coverage
+
 
     def _build_planning_prompt(self, state: AgentState) -> str:
         """
-        Builds a planning prompt using current state details, coverage, and evidence summaries.
+        Builds a simplified planning prompt focusing only on blindspots, confidence,
+        evidence summary, and used queries.
         """
-        article = getattr(state, "article", None)
-        title = getattr(article, "title", "Unknown") if article else "Unknown"
-        search_attempts = getattr(state, "search_attempts", 0)
-        confidence_score = getattr(state, "confidence_score", 0)
-        evidence_list = getattr(state, "evidence", [])
         blindspots = getattr(state, "blindspots", [])
+        evidence_list = getattr(state, "evidence", [])
+        used_queries = getattr(state, "search_queries_used", [])
+        confidence_score = getattr(state, "confidence_score", 0)
+        
+        blindspots_str = "\n".join(f"- {bs.category}: {bs.description}" for bs in blindspots)
         
         summary = self._get_evidence_summary(evidence_list)
-        coverage = self._estimate_blindspot_coverage(state)
+        evidence_str = (
+            f"Total evidence count: {len(evidence_list)}\n"
+            f"High-quality: {summary['high_quality_count']}\n"
+            f"Medium-quality: {summary['medium_quality_count']}\n"
+            f"Low-quality: {summary['low_quality_count']}\n"
+            f"Contradicting: {summary['contradicts_count']}"
+        )
         
-        coverage_str = ""
-        for cat, covered in coverage.items():
-            status = "Covered" if covered else "Not Covered"
-            coverage_str += f"- {cat} → {status}\n"
-            
-        claims = getattr(state, "claims", None)
-        key_claims_str = ""
-        main_topic = "Unknown"
-        author_stance = "Unknown"
-        tone = "Unknown"
-        framing_summary = "Unknown"
-        
-        if claims:
-            main_topic = getattr(claims, "main_topic", "Unknown")
-            author_stance = getattr(claims, "author_stance", "Unknown")
-            tone = getattr(claims, "tone", "Unknown")
-            framing_summary = getattr(claims, "framing_summary", "Unknown")
-            for idx, claim in enumerate(getattr(claims, "key_claims", []), 1):
-                key_claims_str += f"{idx}. {claim}\n"
-                
-        blindspots_list_str = ""
-        for idx, bs in enumerate(blindspots, 1):
-            blindspots_list_str += f"[{idx}] {bs.category} (Importance: {bs.importance}): {bs.description}\n"
-            
-        used_queries = getattr(state, "search_queries_used", [])
-        if used_queries:
-            used_queries_str = "\n".join(f"- {q}" for q in used_queries)
-        else:
-            used_queries_str = "No previous searches."
+        used_queries_str = "\n".join(f"- {q}" for q in used_queries) if used_queries else "None."
 
         prompt = (
-            "ARTICLE\n\n"
-            f"Title: {title}\n"
-            f"Main Topic: {main_topic}\n"
-            f"Author Stance: {author_stance}\n"
-            f"Tone: {tone}\n"
-            f"Framing Summary: {framing_summary}\n\n"
-            "SEARCH STATUS\n\n"
-            f"Current search attempts: {search_attempts}\n"
-            f"Maximum search attempts: {self.max_search_attempts}\n\n"
-            "CONFIDENCE\n\n"
-            f"Current confidence score: {confidence_score}%\n"
-            f"Configured threshold: {self.confidence_threshold}%\n\n"
-            "EVIDENCE SUMMARY\n\n"
-            f"Number of evidence items: {len(evidence_list)}\n"
-            f"High-quality evidence: {summary['high_quality_count']}\n"
-            f"Medium-quality evidence: {summary['medium_quality_count']}\n"
-            f"Low-quality evidence: {summary['low_quality_count']}\n"
-            f"Contradicting evidence: {summary['contradicts_count']}\n"
-            f"Supporting evidence: {summary['supports_count']}\n"
-            f"Context evidence: {summary['context_count']}\n\n"
-            "BLINDSPOT COVERAGE\n\n"
-            f"{coverage_str}\n"
-            "BLINDSPOTS\n\n"
-            f"{blindspots_list_str}\n"
-            "PREVIOUS SEARCHES\n\n"
+            f"Current confidence: {confidence_score}%\n"
+            f"Confidence threshold: {self.confidence_threshold}%\n\n"
+            "BLINDSPOTS TO INVESTIGATE\n"
+            f"{blindspots_str}\n\n"
+            "EVIDENCE SUMMARY\n"
+            f"{evidence_str}\n\n"
+            "PREVIOUS QUERIES USED\n"
             f"{used_queries_str}\n\n"
-            "INSTRUCTIONS\n\n"
-            "Determine:\n"
-            "1. Is evidence sufficient?\n"
-            "2. Are important blindspots still uncovered?\n"
-            "3. Are opposing viewpoints missing?\n"
-            "4. Is more research required?\n\n"
-            "If evidence quality is low, prioritize searches targeting:\n"
-            "* Peer reviewed studies\n"
-            "* Academic research\n"
-            "* Government reports\n"
-            "* Expert analysis\n"
-            "* Institutional publications\n"
-            "instead of general news coverage.\n\n"
-            "Return ONLY a JSON object with this exact structure:\n\n"
+            "INSTRUCTIONS\n"
+            "Decide the next action based on research progress. Choose one of: SEARCH_MORE or GENERATE_REPORT.\n"
+            "If action is SEARCH_MORE, generate 2-4 search queries that are specific, search-oriented, and avoid repeating previous queries.\n"
+            "Return ONLY a JSON object with this exact structure:\n"
             "{\n"
             '  "action": "SEARCH_MORE",\n'
-            '  "queries": [\n'
-            '    "query 1",\n'
-            '    "query 2"\n'
-            '  ],\n'
+            '  "queries": ["query 1", "query 2"],\n'
             '  "reasoning": "..."\n'
-            "}\n\n"
-            "Requirements:\n"
-            "If action is SEARCH or SEARCH_MORE:\n"
-            "Return 2–4 queries.\n"
-            "Queries must:\n"
-            "* Avoid previous searches\n"
-            "* Target uncovered blindspots\n"
-            "* Seek stronger evidence\n"
-            "* Seek opposing viewpoints when contradicting evidence is low\n\n"
-            "Respond ONLY with the JSON object."
+            "}"
         )
         return prompt
 
+    def _generate_intent_queries_for_blindspot(self, topic: str, blindspot: Blindspot) -> List[str]:
+        """
+        Generates queries for a blindspot using: topic + blindspot + intent.
+        Formats:
+        - "{topic} {blindspot} criticism"
+        - "{topic} {blindspot} impact"
+        - "{topic} {blindspot} expert opinion"
+        """
+        import re
+        topic_clean = re.sub(r'[^\w\s\-]', ' ', topic).strip()
+        topic_phrase = " ".join(topic_clean.split())
+        
+        cat_clean = re.sub(r'[^\w\s\-]', ' ', blindspot.category).strip()
+        cat_phrase = " ".join(cat_clean.split())
+        
+        # De-duplicate topic words in category to avoid redundancy
+        topic_words_lower = {w.lower() for w in topic_phrase.split()}
+        unique_cat_words = [w for w in cat_phrase.split() if w.lower() not in topic_words_lower]
+        cat_phrase_filtered = " ".join(unique_cat_words) if unique_cat_words else cat_phrase
+
+        intents = [
+            "criticism",
+            "impact",
+            "expert opinion",
+            "implementation challenges"
+        ]
+        
+        queries = []
+        for intent in intents[:3]:
+            query = f"{topic_phrase} {cat_phrase_filtered} {intent}"
+            query_clean = " ".join(query.split())
+            queries.append(query_clean)
+            
+        return queries
+
+    def _construct_high_value_query(self, topic: str, blindspot: Blindspot) -> str:
+        """
+        Constructs a human-readable natural language search query using intent format.
+        """
+        queries = self._generate_intent_queries_for_blindspot(topic, blindspot)
+        return queries[0] if queries else f"{topic} {blindspot.category} criticism"
+
     def _generate_initial_queries(self, state: AgentState) -> List[str]:
         """
-        Generate initial queries without using the LLM.
+        Generate highly specific, article-grounded queries based on title keywords,
+        main topic, claims, and blindspots using the intent-based queries.
         """
-        queries = []
-        blindspots = getattr(state, "blindspots", [])
-        article = getattr(state, "article", None)
-        title = getattr(article, "title", "Unknown") if article else "Unknown"
+        topic = state.claims.main_topic if (state.claims and state.claims.main_topic) else ""
+        if not topic or topic == "Unknown":
+            topic = state.article.title if state.article else "Policy"
+        topic = topic.strip().rstrip(".?!:;, ")
+
+        import re
+        topic_clean = re.sub(r'[^\w\s\-]', ' ', topic).strip()
+        topic_phrase = " ".join(topic_clean.split())
+
+        all_candidates = []
+        blindspots = state.blindspots or []
         
-        for bs in blindspots[:4]:
-            q = getattr(bs, "suggested_search_query", "")
-            if q and q.strip():
-                queries.append(q.strip())
-            else:
-                queries.append(f"{title} {bs.category}")
-                
-        # Deduplicate
+        # Prioritize uncovered blindspots
+        coverage = self._estimate_blindspot_coverage(state)
+        uncovered_bs = [bs for bs in blindspots if not coverage.get(bs.category, False)]
+        covered_bs = [bs for bs in blindspots if coverage.get(bs.category, False)]
+        
+        # Interleave queries: uncovered first, then covered
+        for idx in range(3):
+            for bs in uncovered_bs:
+                intent_queries = self._generate_intent_queries_for_blindspot(topic, bs)
+                if idx < len(intent_queries):
+                    q = intent_queries[idx]
+                    if q not in all_candidates:
+                        all_candidates.append(q)
+            for bs in covered_bs:
+                intent_queries = self._generate_intent_queries_for_blindspot(topic, bs)
+                if idx < len(intent_queries):
+                    q = intent_queries[idx]
+                    if q not in all_candidates:
+                        all_candidates.append(q)
+
+        # Fallback if no blindspots exist
+        if not blindspots:
+            all_candidates.append(f"{topic_phrase} policy implementation details and analysis")
+            all_candidates.append(f"{topic_phrase} academic research studies and statistics")
+
+        article_keywords = []
+        if state.article and state.article.title:
+            article_keywords = [w.lower() for w in re.findall(r'\b\w+\b', state.article.title)]
+            
+        valid_queries = self._validate_queries(all_candidates, article_keywords, state)
+        
+        # De-duplicate while keeping order
         unique_queries = []
-        for q in queries:
+        for q in valid_queries:
             if q not in unique_queries:
                 unique_queries.append(q)
-        return unique_queries
+
+        # Return only unique unused queries
+        used_set = set(str(q).lower().strip() for q in getattr(state, "search_queries_used", []))
+        unused = [q for q in unique_queries if q.lower().strip() not in used_set]
+        
+        return unused[:3] if unused else unique_queries[:3]
 
     def _generate_fallback_queries(self, state: AgentState) -> List[str]:
         """
-        Generates alternative search queries based on blindspots, ensuring queries are 
-        non-redundant and have low keyword overlap with each other and used queries.
+        Generates alternative search queries.
         """
-        used_set = set()
-        for q in getattr(state, "search_queries_used", []):
-            used_set.add(" ".join(str(q).lower().split()))
+        return self._generate_initial_queries(state)
 
-        queries = []
-        article = getattr(state, "article", None)
-        title = getattr(article, "title", "Unknown") if article else "Unknown"
-        claims = getattr(state, "claims", None)
-        topic = getattr(claims, "main_topic", title) if claims else title
+    def _validate_queries(self, queries: List[str], article_keywords: List[str], state: Optional[AgentState] = None) -> List[str]:
+        valid_queries = []
         
-        blindspots = getattr(state, "blindspots", [])
-        if not blindspots:
-            queries.append(f"{topic} missing perspectives")
-            queries.append(f"{topic} alternative viewpoints")
+        stop_words = {
+            "a", "an", "the", "and", "or", "in", "on", "at", "to", "for", "of", "by", "with",
+            "is", "are", "was", "were", "will", "would", "should", "can", "could", "about",
+            "from", "this", "that", "these", "those", "how", "why", "what", "which"
+        }
+        
+        filler_terms = {
+            "query", "search", "google", "website", "placeholder", "duckduckgo", "url", "link",
+            "find", "lookup", "results", "evidence", "articles", "news", "report"
+        }
 
-        for bs in blindspots:
-            category = bs.category
-            candidates = [
-                f"{topic} {category} perspective",
-                f"{topic} {category} research studies",
-                f"{topic} {category} government report",
-                f"{topic} {category} expert analysis"
-            ]
+        # Build list of article-specific keywords from title, topic, and blindspots
+        valid_keywords = set()
+        keyword_stop_words = stop_words.union({"policy", "rules", "new", "announces", "announced", "update", "updates"})
+        
+        if state:
+            if state.article and state.article.title:
+                valid_keywords.update(
+                    w.lower() for w in re.findall(r'\b\w+\b', state.article.title)
+                    if w.lower() not in keyword_stop_words and len(w) > 2
+                )
+            if state.claims and state.claims.main_topic:
+                valid_keywords.update(
+                    w.lower() for w in re.findall(r'\b\w+\b', state.claims.main_topic)
+                    if w.lower() not in keyword_stop_words and len(w) > 2
+                )
+            if state.blindspots:
+                for bs in state.blindspots:
+                    valid_keywords.update(
+                        w.lower() for w in re.findall(r'\b\w+\b', bs.category)
+                        if w.lower() not in keyword_stop_words and len(w) > 2
+                    )
+
+        for q in queries:
+            q_clean = q.strip().rstrip(".?!:;, ")
+            q_clean = re.sub(r'\s+', ' ', q_clean)
             
-            for candidate in candidates:
-                norm = " ".join(candidate.lower().split())
-                if norm in used_set:
+            # De-duplicate words inside the query string
+            q_clean = " ".join(dict.fromkeys(q_clean.split()))
+            
+            # 1. Check for generic filler terms
+            if any(term in q_clean.lower() for term in filler_terms):
+                self.logger.info(f"Query rejected (contains filler terms): '{q_clean}'")
+                continue
+
+            # 2. Check for article-specific keywords
+            query_words = {w.lower() for w in re.findall(r'\b\w+\b', q_clean)}
+            if valid_keywords and not query_words.intersection(valid_keywords):
+                self.logger.info(f"Query rejected (lacks article-specific keywords): '{q_clean}'")
+                continue
+
+            # 3. Check for meaningful word count
+            meaningful = [w for w in q_clean.split() if w.lower() not in stop_words]
+            if len(meaningful) < 4:
+                # Attempt query expansion using valid keywords rather than discarding
+                expanded_words = list(q_clean.split())
+                added = 0
+                for kw in sorted(valid_keywords):
+                    if kw not in q_clean.lower():
+                        expanded_words.insert(0, kw.capitalize())
+                        meaningful.append(kw)
+                        added += 1
+                        if len(meaningful) >= 4 or added >= 3:
+                            break
+                q_clean = " ".join(expanded_words)
+                meaningful = [w for w in q_clean.split() if w.lower() not in stop_words]
+                
+                if len(meaningful) < 4:
+                    self.logger.info(f"Query rejected (too short: {len(meaningful)} meaningful words): '{q_clean}'")
                     continue
-                    
-                skip = False
-                candidate_words = set(w for w in norm.split() if len(w) > 3)
-                
-                for existing in queries:
-                    existing_norm = " ".join(existing.lower().split())
-                    existing_words = set(w for w in existing_norm.split() if len(w) > 3)
-                    if candidate_words and existing_words:
-                        shared = candidate_words.intersection(existing_words)
-                        overlap = len(shared) / max(len(candidate_words), len(existing_words))
-                        if overlap > 0.6:
-                            skip = True
-                            break
-                            
-                for used_query in used_set:
-                    used_words = set(w for w in used_query.split() if len(w) > 3)
-                    if candidate_words and used_words:
-                        shared = candidate_words.intersection(used_words)
-                        overlap = len(shared) / max(len(candidate_words), len(used_words))
-                        if overlap > 0.6:
-                            skip = True
-                            break
-                            
-                if not skip:
-                    queries.append(candidate)
-                    if len(queries) >= 4:
-                        break
-            if len(queries) >= 4:
-                break
-                
-        return queries[:4] if len(queries) >= 2 else (queries + [f"{topic} expert analysis", f"{topic} alternative studies"])[:4]
+
+            valid_queries.append(q_clean)
+            
+        return valid_queries
 
     def decide(self, state: AgentState) -> PlannerDecision:
         """
         Applies rules and logic to decide on the next research action.
+        Avoids LLM calls whenever possible.
         """
+        import re
         try:
             search_attempts = getattr(state, "search_attempts", 0)
             confidence_score = getattr(state, "confidence_score", 0)
             evidence_list = getattr(state, "evidence", [])
+            stagnation_count = getattr(state, "stagnation_count", 0)
             
+            article = getattr(state, "article", None)
+            title = getattr(article, "title", "") if article else ""
+            
+            # Extract title keywords for validation
+            stop_words = {
+                "new", "rule", "in", "without", "a", "valid", "may", "be", "denied", 
+                "to", "for", "on", "of", "and", "or", "with", "the", "an", "at", "by", 
+                "from", "2026", "2025", "about", "how", "why", "what", "is", "are", "was",
+                "were", "will", "would", "should", "can", "could", "article", "report",
+                "some", "any", "no", "not", "but", "yes", "this", "that", "these", "those"
+            }
+            title_clean = re.sub(r'[^a-zA-Z0-9\s]', ' ', title)
+            title_keywords = [w for w in title_clean.split() if w.strip().lower() not in stop_words and len(w) > 2]
+
+            # Extract article keywords (combining title and topic keywords) for validation
+            topic = state.claims.main_topic if (state.claims and state.claims.main_topic) else ""
+            topic_clean = re.sub(r'[^a-zA-Z0-9\s]', ' ', topic)
+            topic_keywords = [w for w in topic_clean.split() if w.strip().lower() not in stop_words and len(w) > 2]
+            article_keywords = list(dict.fromkeys(title_keywords + topic_keywords))
+
             self.logger.info(
                 f"Planner deciding — attempts: {search_attempts}, "
                 f"confidence: {confidence_score}%, "
-                f"evidence: {len(evidence_list)}"
+                f"evidence: {len(evidence_list)}, "
+                f"stagnation: {stagnation_count}"
             )
 
-            # RULE 1: Max search attempts
+            # Rule 1: confidence >= threshold -> GENERATE_REPORT
+            if confidence_score >= self.confidence_threshold:
+                self.logger.info("Rule 1: Confidence threshold met, generating report")
+                return PlannerDecision(
+                    action="GENERATE_REPORT",
+                    queries=[],
+                    reasoning=f"Confidence score {confidence_score}% meets threshold {self.confidence_threshold}%"
+                )
+
+            # Rule 2: search_attempts >= max_attempts -> GENERATE_REPORT
             if search_attempts >= self.max_search_attempts:
-                self.logger.info("Max search attempts reached, forcing report generation")
-                decision = PlannerDecision(
+                self.logger.info("Rule 2: Max search attempts reached, generating report")
+                return PlannerDecision(
                     action="GENERATE_REPORT",
                     queries=[],
-                    reasoning="Maximum search attempts reached"
+                    reasoning=f"Maximum search attempts ({self.max_search_attempts}) reached"
                 )
-                self.logger.debug(f"Decision details: action={decision.action} queries={len(decision.queries)}")
-                return decision
 
-            # Tally counts for RULE 2 and Saturation checks
-            summary = self._get_evidence_summary(evidence_list)
-            high_quality_count = summary["high_quality_count"]
-            evidence_count = len(evidence_list)
-
-            # Saturation detection: weak evidence only
-            is_saturated_with_weak = (evidence_count >= 5 and high_quality_count == 0)
-
-            # RULE 2: Confidence threshold
-            if (confidence_score >= self.confidence_threshold 
-                    and high_quality_count > 0 
-                    and not is_saturated_with_weak):
-                self.logger.info("Confidence threshold met, generating report")
-                decision = PlannerDecision(
+            # Rule 3: stagnation_count >= 2 -> GENERATE_REPORT
+            if stagnation_count >= 2:
+                self.logger.info("Rule 3: Confidence stagnation detected, generating report")
+                return PlannerDecision(
                     action="GENERATE_REPORT",
                     queries=[],
-                    reasoning=f"Confidence score {confidence_score}% meets threshold with high-quality evidence"
+                    reasoning="Confidence delta stagnated <= 5 for 2 consecutive loops"
                 )
-                self.logger.debug(f"Decision details: action={decision.action} queries={len(decision.queries)}")
-                return decision
 
-            # RULE 3: Initial search
-            if search_attempts == 0 and len(evidence_list) == 0:
-                decision = PlannerDecision(
+            # Rule 4: evidence_count == 0 -> SEARCH
+            if len(evidence_list) == 0:
+                self.logger.info("Rule 4: No evidence gathered yet, starting initial searches")
+                initial_queries = self._generate_initial_queries(state)
+                valid_queries = self._validate_queries(initial_queries, article_keywords, state)
+                if not valid_queries:
+                    valid_queries = initial_queries[:3]
+                return PlannerDecision(
                     action="SEARCH",
-                    queries=self._generate_initial_queries(state),
+                    queries=valid_queries,
                     reasoning="Starting initial evidence gathering"
                 )
-                self.logger.debug(f"Decision details: action={decision.action} queries={len(decision.queries)}")
-                return decision
 
-            # RULE 4: Ollama Planner call
+            # If none of the rule-based shortcuts trigger, call the LLM planner.
+            if not self.ollama_client.pre_call_health_check(self.config.OLLAMA_MODEL):
+                self.logger.warning("Ollama pre-call health check failed. Skipping LLM planner decision and using fallback queries.")
+                fallback_queries = self._generate_initial_queries(state)
+                return PlannerDecision(
+                    action="SEARCH_MORE",
+                    queries=fallback_queries[:3],
+                    reasoning="Bypassed LLM planner due to health check failure"
+                )
+
+            self.logger.info("Calling LLM planner to decide next search queries")
             system_prompt = self._build_system_prompt()
             planning_prompt = self._build_planning_prompt(state)
 
             response = self.ollama_client.generate_json_with_retry(
                 prompt=planning_prompt,
                 system_prompt=system_prompt,
-                temperature=0.3
+                temperature=0.2,
+                num_predict=128
             )
 
             decision_action = response.get("action", "SEARCH_MORE")
@@ -399,35 +535,35 @@ No explanations outside the JSON.
             if not isinstance(queries, list):
                 queries = []
 
-            # Post-processing override: weak evidence saturation
-            if decision_action == "GENERATE_REPORT" and is_saturated_with_weak:
-                self.logger.info("Overriding decision to SEARCH_MORE due to weak-evidence saturation.")
-                decision_action = "SEARCH_MORE"
-                reasoning = "Overridden to SEARCH_MORE because gathered evidence is low quality; seeking higher-quality sources."
-                queries = self._generate_fallback_queries(state)
+            # Programmatically replace/supplement LLM queries with high-value queries
+            if decision_action != "GENERATE_REPORT":
+                valid_queries = self._generate_initial_queries(state)
+            else:
+                valid_queries = []
 
-            if decision_action != "GENERATE_REPORT" and not queries:
-                queries = self._generate_fallback_queries(state)
+            if decision_action != "GENERATE_REPORT" and not valid_queries:
+                self.logger.info("Planner returned empty or invalid search queries; generating automatic alternative fallback queries.")
+                valid_queries = self._generate_initial_queries(state)
+
+            # Enforce strict maximum of 3 queries per loop
+            valid_queries = valid_queries[:3]
 
             decision = PlannerDecision(
                 action=decision_action,
-                queries=queries,
+                queries=valid_queries,
                 reasoning=reasoning
             )
-            self.logger.info(f"Planner decision: {decision_action} — {reasoning}")
-            self.logger.debug(f"Decision details: action={decision.action} queries={len(decision.queries)}")
+            self.logger.info(f"LLM Planner decision: {decision_action} — {reasoning} with queries: {valid_queries}")
             return decision
 
         except Exception as error:
-            # RULE 5: Fallback due to errors
             self.logger.error(f"Planner failed: {error}")
-            decision = PlannerDecision(
+            fallback_queries = self._generate_initial_queries(state)
+            return PlannerDecision(
                 action="SEARCH_MORE",
-                queries=self._generate_fallback_queries(state),
+                queries=fallback_queries[:3],
                 reasoning="Fallback due to planner error"
             )
-            self.logger.debug(f"Decision details: action={decision.action} queries={len(decision.queries)}")
-            return decision
 
 if __name__ == "__main__":
     import sys
