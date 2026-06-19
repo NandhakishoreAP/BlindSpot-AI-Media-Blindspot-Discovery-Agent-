@@ -229,7 +229,12 @@ class SearchTool:
             return False
         return True
 
-    def search(self, query: str) -> List[SearchResult]:
+    def search(
+        self,
+        query: str,
+        article_keywords: set = None,
+        blindspot_keywords: set = None
+    ) -> List[SearchResult]:
         """
         Executes search using DuckDuckGo and returns a list of cleaned SearchResult objects.
         """
@@ -240,6 +245,13 @@ class SearchTool:
             cached_res = self._check_cache(normalized_q)
             if cached_res is not None:
                 return cached_res
+
+        # Setup fallback keywords if not provided
+        stop_words = {"the", "a", "an", "and", "or", "but", "to", "of", "in", "on", "at", "for", "with", "is", "was", "were", "are", "be", "this", "that", "it", "its", "from"}
+        if article_keywords is None:
+            article_keywords = {w.lower() for w in re.findall(r'\b\w+\b', query) if w.lower() not in stop_words and len(w) > 2}
+        if blindspot_keywords is None:
+            blindspot_keywords = {w.lower() for w in re.findall(r'\b\w+\b', query) if w.lower() not in stop_words and len(w) > 2}
 
         try:
             self.logger.info(f"Searching: {query}")
@@ -280,8 +292,8 @@ class SearchTool:
                             filtered_count += 1
                             continue
                             
-                        # Reject thin content (less than 5 words)
-                        if len(body_str.split()) < 5:
+                        # Reject thin content (less than 15 words)
+                        if len(body_str.split()) < 15:
                             filtered_count += 1
                             continue
                             
@@ -291,18 +303,22 @@ class SearchTool:
                             filtered_count += 1
                             continue
 
-                        # Reject unrelated pages (must share at least one keyword with the query)
-                        stop_words = {"criticism", "expert", "opinion", "implementation", "challenges", "unintended", "consequences", "stakeholder", "response", "academic", "analysis", "historical", "outcomes", "and", "the", "for", "with", "about"}
-                        query_words = {w.lower() for w in re.findall(r'\b\w+\b', query) if w.lower() not in stop_words and len(w) > 2}
-                        res_words = {w.lower() for w in re.findall(r'\b\w+\b', title_str + " " + body_str)}
-                        if query_words and not query_words.intersection(res_words):
+                        # Compute overlap score and reject if below dynamic threshold
+                        result_keywords = {w.lower() for w in re.findall(r'\b\w+\b', title_str + " " + body_str)}
+                        overlap_score = len(result_keywords.intersection(article_keywords)) + len(result_keywords.intersection(blindspot_keywords))
+                        threshold = 2
+                        if len(article_keywords) + len(blindspot_keywords) < 4:
+                            threshold = 1
+                        if overlap_score < threshold:
                             filtered_count += 1
                             continue
                             
                         url_lower = url_str.lower()
                         reject_patterns = [
                             "login", "signin", "signup", "/tag/",
-                            "/category/", "/search", "/author/", "/page/"
+                            "/category/", "/search", "/author/", "/page/",
+                            "/directory", "/tags/", "/categories/", "/nav/",
+                            "index.html", "sitemap", "feed/"
                         ]
                         if any(pat in url_lower for pat in reject_patterns):
                             filtered_count += 1
@@ -341,7 +357,7 @@ class SearchTool:
             if filtered_count > 0:
                 self.logger.info(f"Filtered {filtered_count} irrelevant/duplicate/thin/spam/same-domain results")
                 
-            final_results = diverse_results[:self.max_results]
+            final_results = diverse_results[:5]
             if cacheable:
                 self._write_to_cache(normalized_q, final_results)
             self.logger.info(f"Found {len(final_results)} results for: {query}")
@@ -354,7 +370,9 @@ class SearchTool:
     def search_multiple(
         self,
         queries: List[str],
-        delay: float = 0.5
+        delay: float = 0.5,
+        article_keywords: set = None,
+        blindspot_keywords: set = None
     ) -> List[SearchResult]:
         """
         Execute multiple searches sequentially avoiding duplicates and rate limiting.
@@ -364,7 +382,11 @@ class SearchTool:
         domain_counts = {}
         
         for query in queries:
-            query_results = self.search(query)
+            query_results = self.search(
+                query,
+                article_keywords=article_keywords,
+                blindspot_keywords=blindspot_keywords
+            )
             
             for res in query_results:
                 norm_url = res.url.rstrip("/")

@@ -207,8 +207,30 @@ class MediaBlindspotAgent:
                     progress_callback("searching", state)
                     
                 self.logger.info(f"Executing queries: {queries}")
+                
+                # Extract article and blindspot keywords
+                import re
+                stop_words = {
+                    "new", "rule", "in", "without", "a", "valid", "may", "be", "denied", 
+                    "to", "for", "on", "of", "and", "or", "with", "the", "an", "at", "by", 
+                    "from", "2026", "2025", "about", "how", "why", "what", "is", "are", "was",
+                    "were", "will", "would", "should", "can", "could", "article", "report",
+                    "some", "any", "no", "not", "but", "yes", "this", "that", "these", "those"
+                }
+                article_text = f"{state.article.title} {state.claims.main_topic if state.claims else ''}"
+                article_clean = re.sub(r'[^a-zA-Z0-9\s]', ' ', article_text)
+                article_keywords = {w.lower() for w in article_clean.split() if w.strip().lower() not in stop_words and len(w) > 2}
+                
+                blindspot_text = " ".join(f"{bs.category} {bs.description}" for bs in state.blindspots)
+                blindspot_clean = re.sub(r'[^a-zA-Z0-9\s]', ' ', blindspot_text)
+                blindspot_keywords = {w.lower() for w in blindspot_clean.split() if w.strip().lower() not in stop_words and len(w) > 2}
+
                 start_time_search = time.time()
-                search_results = self.search_tool.search_multiple(queries)
+                search_results = self.search_tool.search_multiple(
+                    queries,
+                    article_keywords=article_keywords,
+                    blindspot_keywords=blindspot_keywords
+                )
                 self.logger.info(f"TIMING: Search execution completed in {time.time() - start_time_search:.2f} seconds")
                 
                 total_queries_run += len(queries)
@@ -422,7 +444,8 @@ class MediaBlindspotAgent:
                     key_claims=[],
                     author_stance="Unknown",
                     tone="Unknown",
-                    framing_summary="Access Restricted"
+                    framing_summary="Access Restricted",
+                    claim_confidences=[]
                 )
                 state.blindspots = []
                 state.evidence = []
@@ -549,8 +572,29 @@ class MediaBlindspotAgent:
                 
                 self._update_state_status(state, "searching")
                 
+                # Extract article and blindspot keywords for fallback path
+                import re
+                stop_words = {
+                    "new", "rule", "in", "without", "a", "valid", "may", "be", "denied", 
+                    "to", "for", "on", "of", "and", "or", "with", "the", "an", "at", "by", 
+                    "from", "2026", "2025", "about", "how", "why", "what", "is", "are", "was",
+                    "were", "will", "would", "should", "can", "could", "article", "report",
+                    "some", "any", "no", "not", "but", "yes", "this", "that", "these", "those"
+                }
+                article_text = f"{state.article.title} {state.claims.main_topic if state.claims else ''}"
+                article_clean = re.sub(r'[^a-zA-Z0-9\s]', ' ', article_text)
+                article_keywords = {w.lower() for w in article_clean.split() if w.strip().lower() not in stop_words and len(w) > 2}
+                
+                blindspot_text = " ".join(f"{bs.category} {bs.description}" for bs in state.blindspots)
+                blindspot_clean = re.sub(r'[^a-zA-Z0-9\s]', ' ', blindspot_text)
+                blindspot_keywords = {w.lower() for w in blindspot_clean.split() if w.strip().lower() not in stop_words and len(w) > 2}
+
                 start_time_search = time.time()
-                search_results = self.search_tool.search_multiple([query])
+                search_results = self.search_tool.search_multiple(
+                    [query],
+                    article_keywords=article_keywords,
+                    blindspot_keywords=blindspot_keywords
+                )
                 self.logger.info(f"TIMING: Search execution completed in {time.time() - start_time_search:.2f} seconds")
                 
                 state.metrics["searches_executed"] += 1

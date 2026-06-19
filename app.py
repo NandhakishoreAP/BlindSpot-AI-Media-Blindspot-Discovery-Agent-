@@ -179,7 +179,10 @@ def get_full_report_data(report) -> dict:
     if not url_to_match:
         return {}
         
-    for rf in reports_dir.glob("report_*.json"):
+    report_files = list(reports_dir.glob("report_*.json"))
+    report_files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    
+    for rf in report_files:
         try:
             with open(rf, "r", encoding="utf-8") as f:
                 data = json.load(f)
@@ -247,13 +250,17 @@ with st.sidebar:
     
     # Settings Section
     st.markdown("### Settings")
+    dev_mode = False
     try:
         config = Config.from_env()
         st.text_input("Model", value=config.OLLAMA_MODEL, disabled=True)
         st.number_input("Confidence Threshold", value=config.CONFIDENCE_THRESHOLD, disabled=True)
         st.number_input("Max Search Attempts", value=config.MAX_SEARCH_ATTEMPTS, disabled=True)
+        debug_mode_config = getattr(config, "DEBUG_MODE", False)
+        dev_mode = st.checkbox("Developer Mode", value=debug_mode_config)
     except Exception:
         st.warning("Failed to load settings configuration.")
+        dev_mode = st.checkbox("Developer Mode", value=False)
         
     st.markdown("---")
     
@@ -682,6 +689,13 @@ else:
                 st.markdown(f"**Importance:** {importance}")
                 st.markdown(f"**Description:** {getattr(bs, 'description', '')}")
                 st.markdown(f"**Suggested Search:** `{getattr(bs, 'suggested_search_query', '')}`")
+                
+                # Related Claims rendering
+                related_claims = getattr(bs, 'related_claims', [])
+                if related_claims:
+                    st.markdown("**Related Claims:**")
+                    for claim in related_claims:
+                        st.markdown(f"- {claim}")
 
     # 5. Evidence Analysis (HTML Table & Badges & Expand Details)
     st.markdown("#### Evidence Analysis")
@@ -695,76 +709,32 @@ else:
         if not evidence_list:
             st.info("No supporting evidence registered.")
         else:
-            # Construct a beautiful HTML table with Linear styled badges
-            rows_html = ""
-            for ev in evidence_list:
-                source = ev.get("search_result", {}).get("source", "Reference")
-                relevance = ev.get("relevance", "Adds Context")
-                quality = ev.get("quality", "Medium")
-                insight = ev.get("key_insight", "")
-                
-                # Relevance Badge
-                rel_lower = relevance.lower()
-                if "support" in rel_lower or "high" in rel_lower:
-                    rel_badge = f'<span class="badge badge-success">{relevance}</span>'
-                elif "refute" in rel_lower or "contradict" in rel_lower:
-                    rel_badge = f'<span class="badge badge-danger">{relevance}</span>'
-                else:
-                    rel_badge = f'<span class="badge badge-accent">{relevance}</span>'
-                    
-                # Quality Badge
-                q_lower = quality.lower()
-                if "high" in q_lower:
-                    q_badge = f'<span class="badge badge-success">{quality}</span>'
-                elif "medium" in q_lower:
-                    q_badge = f'<span class="badge badge-warning">{quality}</span>'
-                else:
-                    q_badge = f'<span class="badge badge-danger">{quality}</span>'
-                    
-                # Truncated insight
-                trunc_insight = insight[:75] + "..." if len(insight) > 75 else insight
-                
-                rows_html += f"""
-                <tr style="border-bottom: 1px solid var(--border);">
-                    <td style="padding: 12px; font-weight: 500;">{rel_badge}</td>
-                    <td style="padding: 12px; font-weight: 500;">{q_badge}</td>
-                    <td style="padding: 12px; color: var(--text-primary);">{source}</td>
-                    <td style="padding: 12px; color: var(--text-secondary);">{trunc_insight}</td>
-                </tr>
-                """
-                
-            table_html = f"""
-            <div style="overflow-x: auto; margin-bottom: 16px;">
-                <table style="width: 100%; border-collapse: collapse; text-align: left; font-size: 0.9rem;">
-                    <thead>
-                        <tr style="border-bottom: 2px solid var(--border); background-color: rgba(255, 255, 255, 0.02);">
-                            <th style="padding: 12px; color: var(--text-secondary); font-weight: 600; width: 15%;">Relevance</th>
-                            <th style="padding: 12px; color: var(--text-secondary); font-weight: 600; width: 15%;">Quality</th>
-                            <th style="padding: 12px; color: var(--text-secondary); font-weight: 600; width: 20%;">Source</th>
-                            <th style="padding: 12px; color: var(--text-secondary); font-weight: 600; width: 50%;">Key Insight Summary</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        {rows_html}
-                    </tbody>
-                </table>
-            </div>
-            """
-            st.markdown(table_html, unsafe_allow_html=True)
-            
-            # Expand Details
-            st.markdown("<div style='font-size: 0.85rem; font-weight: 600; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 10px; margin-top: 20px;'>Expand Evidence Details</div>", unsafe_allow_html=True)
             for idx, ev in enumerate(evidence_list):
                 source = ev.get("search_result", {}).get("source", "Reference")
                 url = ev.get("search_result", {}).get("url", "")
                 relevance = ev.get("relevance", "Adds Context")
                 quality = ev.get("quality", "Medium")
                 insight = ev.get("key_insight", "")
+                evidence_sum = ev.get("evidence_summary", "")
+                related_bs = ev.get("related_blindspot", "")
                 
-                with st.expander(f"{idx+1}. {source} — {relevance} (Quality: {quality})"):
+                with st.container(border=True):
+                    col1, col2 = st.columns([3, 1])
+                    with col1:
+                        st.markdown(f"### {source}")
+                    with col2:
+                        st.markdown(f"**Relevance:** {relevance}  \n**Quality:** {quality}")
+                    
                     st.markdown(f"**Key Insight:** {insight}")
-                    if url:
-                        st.markdown(f"**URL:** [Link]({url})")
+                    if evidence_sum:
+                        st.markdown(f"**Summary:** {evidence_sum}")
+                    
+                    col3, col4 = st.columns([3, 1])
+                    with col3:
+                        st.caption(f"Linked Perspective Gap: {related_bs if related_bs else 'Unlinked'}")
+                    with col4:
+                        if url:
+                            st.markdown(f"[View Source ↗]({url})")
 
     # 6. Conclusion (Clean panel, readable, no borders)
     st.markdown("#### Conclusion")
@@ -846,6 +816,13 @@ Generated by BlindSpot AI.
     dl_col3.download_button("Download Executive Summary", txt_summary, file_name="executive_summary.txt", mime="text/plain", key="dl_txt")
 
     # Developer Tools
-    st.markdown("---")
-    with st.expander("Developer Tools", expanded=False):
-        st.json(json_data)
+    debug_mode_env = False
+    try:
+        debug_mode_env = getattr(Config.from_env(), "DEBUG_MODE", False)
+    except Exception:
+        pass
+        
+    if dev_mode or debug_mode_env:
+        st.markdown("---")
+        with st.expander("Developer Tools", expanded=False):
+            st.json(json_data)

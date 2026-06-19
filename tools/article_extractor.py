@@ -12,6 +12,11 @@ from config import Config
 
 
 class ArticleExtractor:
+    """Extract and validate news article content from a URL.
+
+    This class now includes strict validation to ensure only genuine article pages are processed.
+    It rejects homepages, category pages, and pages with insufficient content.
+    """
     def __init__(self, config: Config):
         self.config = config
         self.logger = get_logger("article_extractor")
@@ -172,6 +177,10 @@ class ArticleExtractor:
         return "Unknown"
 
     def _extract_content(self, soup: BeautifulSoup) -> str:
+        """Extract the main article body.
+
+        Returns cleaned paragraph text joined by double newlines.
+        """
         content_soup = BeautifulSoup(str(soup), "lxml")
 
         for tag in content_soup(
@@ -249,7 +258,34 @@ class ArticleExtractor:
         except Exception:
             return "Unknown"
 
+    # Original deterministic_title_from_url moved; see later definition.
+
+    # Original _generate_fallback_article moved; see later definition.
+
+    def is_valid_news_article(self, title: str, content: str, raw_html: str) -> bool:
+        """Validate that the extracted page is a genuine news article.
+
+        Rules:
+        * Title must not be empty, generic placeholder, or indicate a homepage.
+        * If the article body has >= 500 words, accept automatically.
+        * Otherwise, require either word count >= 200 OR at least 4 paragraphs,
+          and the ratio of article body length to raw HTML length >= 0.5.
+        """
+        if not title or title.lower().startswith("homepage") or title == "Unknown Title":
+            return False
+        word_count = len(content.split())
+        # Automatic acceptance for long articles
+        if word_count >= 500:
+            return True
+        paragraph_count = len([p for p in content.split("\n\n") if p.strip()])
+        # Compute body ratio (avoid division by zero)
+        body_ratio = len(content) / len(raw_html) if raw_html else 0
+        if (word_count >= 200 or paragraph_count >= 4) and body_ratio >= 0.5:
+            return True
+        return False
+
     def deterministic_title_from_url(self, url: str) -> str:
+        """Generate a deterministic title from a URL when extraction fails."""
         try:
             parsed = urlparse(url)
             path = parsed.path.strip("/")
@@ -291,6 +327,14 @@ class ArticleExtractor:
         if not self.validate_url(url):
             self.logger.warning(f"Invalid URL '{url}' passed to extract. Generating structured fallback.")
             art = self._generate_fallback_article(url, "Invalid Web Link")
+            art.access_restricted = True
+            return art
+
+        # Homepage detection – reject URLs without a path component
+        parsed_url = urlparse(url)
+        if parsed_url.path.strip('/') == '':
+            self.logger.warning("URL appears to be a homepage, not an article. Prompting user for specific article URL.")
+            art = self._generate_fallback_article(url, "Homepage detected")
             art.access_restricted = True
             return art
 
@@ -400,6 +444,7 @@ class ArticleExtractor:
                     return self._generate_fallback_article(url)
 
         # Check for category page bypass
+                # Reject obvious category pages
         if (
             title.lower().strip() in self.category_titles
             and word_count < 300
@@ -407,11 +452,12 @@ class ArticleExtractor:
             self.logger.warning("URL appears to be a category page, not a news article. Using fallback content.")
             return self._generate_fallback_article(url, title)
 
-        # Final check
-        word_count = len(content.split())
-        if word_count < 80:
-            self.logger.warning(f"Extracted content is still too short ({word_count} words). Constructing full fallback article.")
+        # Final validation based on refined rules
+        if not self.is_valid_news_article(title, content, response_text):
+            self.logger.warning("Article failed validation checks. Falling back to metadata-only article.")
             return self._generate_fallback_article(url, title)
+
+        # If we reach here the article is considered valid
 
         article = ArticleData(
             url=url,

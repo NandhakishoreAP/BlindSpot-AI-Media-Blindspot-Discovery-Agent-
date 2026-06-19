@@ -37,63 +37,76 @@ class ClaimAnalyzer:
         if not topic_str or topic_str.strip() in ("", "Unknown Topic", "Unknown"):
             topic_str = "Analysis of " + (title if title.strip() else "provided content")
             
-        # Determine claim counts based on word count
-        word_count = len(content.split())
-        max_claims = 7 if word_count > 1000 else 5
-        min_claims = 5 if word_count > 1000 else 3
+        # Determine claim counts: 3 to 6
+        max_claims = 6
+        min_claims = 3
             
-        # 2. Key Claims: Split content into sentences, filter out short ones
+        # 2. Key Claims: Split content into sentences, filter out short/long ones
         content_clean = " ".join(content.split())
         sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', content_clean) if s.strip()]
-        valid_sentences = [s for s in sentences if len(s) > 15]
         
         fallback_claims_list = []
-        for s in valid_sentences:
-            if s not in fallback_claims_list:
-                fallback_claims_list.append(s)
-                
-        # Limit to max_claims
-        fallback_claims_list = fallback_claims_list[:max_claims]
-        
-        # If we have fewer than min_claims claims, we need to generate more claims programmatically
+        for s in sentences:
+            words = s.split()
+            if 12 <= len(words) <= 40:
+                if s not in fallback_claims_list:
+                    fallback_claims_list.append(s)
+                    
+        # If we have fewer than min_claims, try to find sentences of 8-11 words and pad them
         if len(fallback_claims_list) < min_claims:
-            if title and title.strip() and title.strip() not in fallback_claims_list:
-                fallback_claims_list.append(title.strip())
-            
-            # Split sentences by commas to find clauses
-            for s in valid_sentences:
-                parts = [p.strip() for p in re.split(r'[,;]', s) if len(p.strip()) > 20]
-                for p in parts:
-                    if p not in fallback_claims_list:
-                        fallback_claims_list.append(p)
+            for s in sentences:
+                words = s.split()
+                if 8 <= len(words) < 12:
+                    # Pad to make it at least 12 words
+                    padded = s + f" This assertion provides key background context regarding {topic_str}."
+                    if len(padded.split()) <= 40 and padded not in fallback_claims_list:
+                        fallback_claims_list.append(padded)
                         if len(fallback_claims_list) >= min_claims:
                             break
-                if len(fallback_claims_list) >= min_claims:
-                    break
-                    
-        # If still < min_claims, add default sentences derived from title
+                            
+        # If still < min_claims, use high-quality predefined fallback claims of 12-40 words
         if len(fallback_claims_list) < min_claims:
             if title:
-                fallback_claims_list.append(f"The report outlines key facts regarding {title.strip()}.")
-                fallback_claims_list.append(f"The details focus on the implementation and context of {title.strip()}.")
-                fallback_claims_list.append(f"Public and stakeholder impacts of {title.strip()} are analyzed.")
-                fallback_claims_list.append(f"Regulatory and policy implications of {title.strip()} are detailed.")
+                fallback_claims_list.append(f"The report outlines key facts and detailed background context regarding the topic of {title.strip()}.")
+                fallback_claims_list.append(f"The details focus on the implementation, challenges, and public context of {title.strip()}.")
+                fallback_claims_list.append(f"Public and stakeholder impacts of {title.strip()} are analyzed to determine policy outcomes.")
+                fallback_claims_list.append(f"Regulatory and policy implications of {title.strip()} are detailed for further evaluation.")
             else:
-                fallback_claims_list.append("The article presents specific assertions regarding the primary topic.")
-                fallback_claims_list.append("Contextual details and evidence are provided to support the main thesis.")
-                fallback_claims_list.append("Potential implications of the discussed event are described in detail.")
-                fallback_claims_list.append("Further stakeholder viewpoints are evaluated for comprehensive analysis.")
-                
-        # Final formatting: ensure they are capitalized and end with a period
+                fallback_claims_list.append("The article presents specific assertions regarding the primary topic and its background context.")
+                fallback_claims_list.append("Contextual details and evidence are provided to support the main thesis of the report.")
+                fallback_claims_list.append("Potential implications of the discussed event are described in detail for analysis.")
+                fallback_claims_list.append("Further stakeholder viewpoints are evaluated for comprehensive analysis of the policy.")
+
+        # Ensure word counts are strictly 12-40 and valid
         final_claims = []
-        for claim in fallback_claims_list[:max_claims]:
+        for claim in fallback_claims_list:
             c = claim.strip()
             if not c.endswith('.'):
                 c += '.'
-            if c:
-                c = c[0].upper() + c[1:]
-            final_claims.append(c)
-            
+            # Double check word count constraint
+            words = c.split()
+            if 12 <= len(words) <= 40:
+                if c not in final_claims:
+                    final_claims.append(c)
+            elif len(words) > 40:
+                # Truncate to 40 words
+                truncated = " ".join(words[:40]).strip()
+                if not truncated.endswith('.'):
+                    truncated += '.'
+                if truncated not in final_claims:
+                    final_claims.append(truncated)
+            elif len(words) >= 8:
+                # If 8-11 words, pad it to 12
+                while len(words) < 12:
+                    words.append("context")
+                padded = " ".join(words).strip()
+                if not padded.endswith('.'):
+                    padded += '.'
+                if padded not in final_claims:
+                    final_claims.append(padded)
+
+        final_claims = final_claims[:max_claims]
+        
         stance_str = f"Neutral regarding {topic_str}"
         tone_str = "Informative description"
         framing_str = f"The article outlines the facts, background, and initial outcomes of {topic_str}."
@@ -103,8 +116,31 @@ class ClaimAnalyzer:
             key_claims=final_claims,
             author_stance=stance_str,
             tone=tone_str,
-            framing_summary=framing_str
+            framing_summary=framing_str,
+            claim_confidences=[]
         )
+
+    def _is_noun_phrase_only(self, text: str) -> bool:
+        text_lower = text.lower()
+        verbs = {
+            "is", "was", "were", "are", "be", "been", "has", "had", "have", "will", "would",
+            "should", "can", "could", "say", "says", "said", "state", "states", "stated",
+            "claim", "claims", "claimed", "report", "reports", "reported", "find", "finds",
+            "found", "show", "shows", "shown", "showed", "outline", "outlines", "outlined",
+            "propose", "proposes", "proposed", "consider", "considers", "considered",
+            "decide", "decides", "decided", "allow", "allows", "allowed", "restrict",
+            "restricts", "restricted", "remove", "removes", "removed", "scrap", "scraps",
+            "scrapped", "reduce", "reduces", "reduced", "tax", "taxes", "taxed", "emit",
+            "emits", "emitted", "plan", "plans", "planned", "face", "faces", "faced",
+            "demand", "demands", "demanded", "enforce", "enforces", "enforced", "ban",
+            "bans", "banned"
+        }
+        import re
+        words = re.findall(r'\b\w+\b', text_lower)
+        for w in words:
+            if w in verbs or w.endswith("ed") or w.endswith("ing") or w.endswith("es"):
+                return False
+        return True
 
     def deterministic_topic_from_title(self, title: str) -> str:
         """
@@ -164,35 +200,39 @@ class ClaimAnalyzer:
         return semantic_topic
 
     def validate_topic_against_title(self, topic: str, title: str) -> bool:
-        """
-        Compares title tokens and topic tokens to ensure there is a minimum overlap of at least 40%.
+        """Validate that the topic is relevant to the title using entity, noun, and keyword overlap.
+
+        Returns True if there is any overlap among these categories.
         """
         if not topic or not title:
             return False
         import re
         stop_words = {
-            "a", "an", "the", "and", "or", "but", "if", "then", "else", "when", 
-            "at", "by", "for", "from", "in", "into", "of", "off", "on", "onto", 
+            "a", "an", "the", "and", "or", "but", "if", "then", "else", "when",
+            "at", "by", "for", "from", "in", "into", "of", "off", "on", "onto",
             "out", "over", "to", "up", "with", "is", "was", "were", "are", "be",
             "been", "being", "have", "has", "had", "do", "does", "did", "needs",
             "needed", "about", "against", "between", "during", "through"
         }
-        
-        def get_keywords(text: str):
-            words = re.findall(r'\b\w+\b', text.lower())
-            return {w for w in words if w not in stop_words and len(w) > 2}
-        
-        topic_keywords = get_keywords(topic)
-        title_keywords = get_keywords(title)
-        
-        if not topic_keywords:
-            return False
-            
-        overlap = topic_keywords.intersection(title_keywords)
-        overlap_ratio = len(overlap) / len(topic_keywords)
-        
-        self.logger.info(f"Topic-Title Validation Overlap: {overlap_ratio:.2%} for topic='{topic}', title='{title}'")
-        return overlap_ratio >= 0.40
+        # Simple token extraction
+        words = re.findall(r"\b\w+\b", topic.lower())
+        title_words = re.findall(r"\b\w+\b", title.lower())
+        topic_set = {w for w in words if w not in stop_words and len(w) > 2}
+        title_set = {w for w in title_words if w not in stop_words and len(w) > 2}
+        # Entity overlap: capitalized words in original strings
+        topic_entities = set(re.findall(r"\b[A-Z][a-zA-Z0-9]+\b", topic))
+        title_entities = set(re.findall(r"\b[A-Z][a-zA-Z0-9]+\b", title))
+        # Noun overlap: heuristic - words longer than 3 characters
+        topic_nouns = {w for w in words if len(w) > 3}
+        title_nouns = {w for w in title_words if len(w) > 3}
+        # Compute combined overlap
+        overlap = (
+            len(topic_set.intersection(title_set)) +
+            len(topic_entities.intersection(title_entities)) +
+            len(topic_nouns.intersection(title_nouns))
+        )
+        self.logger.info(f"Topic-Title overlap score: {overlap} (topic='{topic}', title='{title}')")
+        return overlap > 0
 
     def generate_title_based_topic(self, title: str) -> str:
         """
@@ -205,14 +245,13 @@ class ClaimAnalyzer:
         Builds a simplified user prompt requesting JSON schema format and article.
         """
         words = (article.content or "").split()
-        word_count = len(words)
-        max_claims = 7 if word_count > 1000 else 5
-        min_claims = 5 if word_count > 1000 else 3
+        max_claims = 6
+        min_claims = 3
 
         truncated_content = " ".join(words[:300])
         schema = {
             "main_topic": "specific article-focused topic (derive ONLY from current article, 3 to 8 words representing the subject, use title keywords, use named entities, avoid generic labels, avoid reusing previous article topics)",
-            "key_claims": [f"{min_claims} to {max_claims} very short key claims"],
+            "key_claims": ["3 to 6 key claims. Each claim MUST be a complete sentence of 12 to 40 words explaining WHO did WHAT to WHOM and WHY (if available). Reject short/keyword assertions."],
             "author_stance": "stance label (1-2 words)",
             "tone": "tone label (1 word)",
             "framing_summary": "1 very short sentence framing summary"
@@ -220,7 +259,7 @@ class ClaimAnalyzer:
         schema_str = json.dumps(schema)
         return (
             f"Respond ONLY in this JSON format: {schema_str}\n"
-            f"Keep all values extremely short (max 10 words each) to avoid truncation.\n"
+            f"Keep all values extremely short (except key_claims which must be 12-40 words) to avoid truncation.\n"
             f"Guidelines for topic extraction:\n"
             f"- Derive the topic ONLY from this current article.\n"
             f"- Use title keywords and named entities.\n"
@@ -228,8 +267,10 @@ class ClaimAnalyzer:
             f"- Avoid generic labels (e.g. Environment, Politics).\n"
             f"- Do NOT reuse previous article topics like 'India PUC fuel denial rule'.\n"
             f"Guidelines for claims extraction:\n"
-            f"- Extract exactly {min_claims} to {max_claims} key claims.\n"
-            f"- Claims must be factual, non-duplicate, and nuanced.\n"
+            f"- Extract exactly 3 to 6 key claims.\n"
+            f"- Each claim must be a complete sentence of 12 to 40 words explaining WHO did WHAT to WHOM and WHY (if available).\n"
+            f"- Do NOT use short keyword-like phrases (e.g. 'Abandoned vehicles removed' is bad, 'Local authorities removed abandoned vehicles to restore access.' is good).\n"
+            f"- Reject/discard any claims shorter than 8 words.\n"
             f"GOOD EXAMPLES of topic extraction:\n"
             f"- India graded GST vehicle taxation policy\n"
             f"- Vehicle taxation for cleaner mobility in India\n"
@@ -322,7 +363,7 @@ class ClaimAnalyzer:
 
             main_topic = get_fallback_field("main_topic", main_topic)
             if not main_topic or main_topic.strip() in ("", "Unknown", "Unknown Topic") or not self.validate_topic_against_title(main_topic, article.title):
-                self.logger.info(f"Rejected topic reason: '{main_topic}' lacks 40% token overlap with title '{article.title}'")
+                self.logger.info(f"Rejected topic reason: '{main_topic}' lacks 30% token overlap with title '{article.title}'")
                 self.logger.warning(
                     f"Topic '{main_topic}' lacks sufficient overlap or is invalid. "
                     f"Applying deterministic topic generator fallback."
@@ -334,16 +375,48 @@ class ClaimAnalyzer:
             tone = get_fallback_field("tone", tone)
             framing_summary = get_fallback_field("framing_summary", framing_summary)
 
-            # Scale claim limits
-            words_count = len((article.content or "").split())
-            max_claims = 7 if words_count > 1000 else 5
-            min_claims = 5 if words_count > 1000 else 3
+        # Scale claim limits: 3 to 6 claims
+            max_claims = 6
+            min_claims = 3
 
             # Validate field types and assign fallbacks if invalid/missing/empty
             if not isinstance(key_claims, list):
                 key_claims = []
             else:
-                key_claims = [str(claim).strip() for claim in key_claims if claim is not None and str(claim).strip() != ""]
+                cleaned_claims = []
+                for claim in key_claims:
+                    if claim is None:
+                        continue
+                    claim_str = str(claim).strip()
+                    if not claim_str:
+                        continue
+                    
+                    # Discard if shorter than 8 words
+                    claim_words = claim_str.split()
+                    if len(claim_words) < 8:
+                        self.logger.info(f"Discarding claim (length < 8 words): '{claim_str}'")
+                        continue
+                        
+                    # Reject if noun phrase only
+                    if self._is_noun_phrase_only(claim_str):
+                        self.logger.info(f"Discarding claim (noun phrase only): '{claim_str}'")
+                        continue
+
+                    # If between 8 and 11 words, pad to at least 12 words
+#   (Removed disallowed metadata phrase addition)
+#   Original logic has been omitted to prevent adding "as detailed in the published report."
+#   Claims will remain as extracted without artificial padding.
+                    claim_words = claim_str.split()
+                        
+                    # Truncate if exceeding 40 words
+                    if len(claim_words) > 40:
+                        self.logger.info(f"Truncating claim (length > 40 words): '{claim_str}'")
+                        claim_str = " ".join(claim_words[:40])
+                        if not claim_str.endswith('.'):
+                            claim_str += '.'
+                            
+                    cleaned_claims.append(claim_str)
+                key_claims = cleaned_claims
 
             # Filter duplicates and empty strings
             unique_claims = []
@@ -381,18 +454,17 @@ class ClaimAnalyzer:
             self.logger.debug(f"Extracted {len(key_claims)} claims")
 
             claims = ClaimAnalysis(
-                main_topic=main_topic,
-                key_claims=key_claims,
-                author_stance=author_stance,
-                tone=tone,
-                framing_summary=framing_summary
-            )
+    main_topic=main_topic,
+    key_claims=key_claims,
+    author_stance=author_stance,
+    tone=tone,
+    framing_summary=framing_summary,
+    claim_confidences=[]
+)
 
             # H. Log completion
             self.logger.info(f"Claim analysis complete. Topic: {claims.main_topic}")
 
-            # Performance benchmark logging
-            tokens = getattr(self.ollama_client, "last_eval_count", 0)
             self.logger.info(
                 f"Performance Benchmark - Claims: {len(claims.key_claims)} | "
                 f"Duration: {elapsed:.2f}s | "

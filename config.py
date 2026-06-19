@@ -19,6 +19,7 @@ class Config:
     MAX_RESEARCH_SECONDS: int = 90
     REQUEST_TIMEOUT_SECONDS: int = 60
     REPORTS_DIR: str = "reports"
+    DEBUG_MODE: bool = False
 
     @classmethod
     def from_env(cls):
@@ -56,6 +57,7 @@ class Config:
             cls.REQUEST_TIMEOUT_SECONDS = 60
             
         cls.REPORTS_DIR = os.getenv("REPORTS_DIR", "reports")
+        cls.DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
         
         # Creates the reports/ directory automatically if it doesn't exist
         Path(cls.REPORTS_DIR).mkdir(parents=True, exist_ok=True)

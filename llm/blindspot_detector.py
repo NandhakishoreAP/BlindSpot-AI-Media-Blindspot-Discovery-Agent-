@@ -77,18 +77,19 @@ class BlindspotDetector:
             "Title: " + str(article.title) + "\n"
             "Topic: " + str(claims.main_topic) + "\n"
             "Claims:\n" + key_claims_list + "\n"
-            "Identify exactly 2 to 3 key blindspots. Return a JSON object in this format:\n"
+            "Identify exactly 3 to 5 key blindspots representing missing perspectives, referencing specific entities, stakeholders, policies, or locations mentioned in the article.\n"
+            "Return a JSON object in this format:\n"
             "{\n"
             '  "blindspots": [\n'
             "    {\n"
-            '      "category": "Domain-Specific Category (e.g. Teacher salary allocation, Rural school funding gaps, Student accessibility barriers)",\n'
-            '      "description": "Short explanation (max 12 words)",\n'
+            '      "category": "Specific category (at least 4 words, e.g. Teacher salary budget allocation, Rural school funding gaps, Student accessibility barriers)",\n'
+            '      "description": "Short explanation of the omission (max 12 words)",\n'
             '      "importance": "High | Medium | Low",\n'
-            '      "suggested_search_query": "Short query (max 6 words)"\n'
+            '      "suggested_search_query": "Short query to research the missing perspective (max 6 words)"\n'
             "    }\n"
             "  ]\n"
             "}\n"
-            "IMPORTANT: Every category MUST represent a genuine missing perspective, NOT a restatement of the article topic or claims.\n"
+            "IMPORTANT: Every category MUST represent a genuine missing perspective, have at least 4 words, and NOT be a generic label or restate the topic/claims.\n"
             "Keep descriptions under 12 words and queries under 6 words to avoid truncation."
         )
         return prompt
@@ -146,13 +147,120 @@ class BlindspotDetector:
             "policy alternatives",
             "other perspectives",
             "unrepresented viewpoints",
-            "regulatory challenges"
+            "regulatory challenges",
+            "community engagement"
         ]
         cat_lower = category.lower().strip()
         for gen in generic_list:
             if cat_lower == gen or gen in cat_lower:
                 return True
         return False
+
+    def is_generic_blindspot(self, category: str, article: ArticleData = None, title: str = None, topic: str = None) -> bool:
+        if not category:
+            return True
+        cat_lower = category.lower().strip()
+        
+        generic_list = [
+            "opposing perspective", "historical context", "economic impact", "expert opinion",
+            "stakeholder view", "alternative perspective", "enforcement challenges", "historical outcomes",
+            "unintended consequences", "missing context", "transparency", "social impact",
+            "environmental impact", "governance", "policy alternatives", "other perspectives",
+            "unrepresented viewpoints", "regulatory challenges", "community engagement",
+            "social concerns", "public opinion", "stakeholder response"
+        ]
+        
+        if cat_lower in generic_list:
+            return True
+            
+        import re
+        stop_words = {
+            "the", "and", "for", "with", "about", "new", "rule", "policy", "report", "news", 
+            "article", "impact", "challenges", "consequences", "outcomes", "perspectives",
+            "transparency", "governance", "alternatives", "response", "opinion", "social",
+            "environmental", "economic", "historical", "context", "expert", "stakeholder"
+        }
+        
+        text_for_entities = ""
+        content_sample = ""
+        if article:
+            text_for_entities += (article.title or "") + " "
+            if article.content:
+                content_sample = article.content[:1000]
+        if title:
+            text_for_entities += title + " "
+        if topic:
+            text_for_entities += topic + " "
+            
+        text_for_entities += content_sample
+        
+        capitalized_words = set(re.findall(r'\b[A-Z][A-Za-z0-9\-]+\b', text_for_entities))
+        all_words = re.findall(r'\b\w+\b', text_for_entities.lower())
+        keywords = {w for w in all_words if w not in stop_words and len(w) > 3}
+        
+        entity_keywords = {w.lower() for w in capitalized_words if w.lower() not in stop_words and len(w) > 2}
+        combined_article_terms = entity_keywords.union(keywords)
+        
+        cat_words = set(re.findall(r'\b\w+\b', cat_lower))
+        cat_words_no_stops = {w for w in cat_words if w not in stop_words}
+        
+        if cat_words_no_stops.intersection(combined_article_terms):
+            return False
+            
+        return True
+
+    def description_repeats_claims(self, description: str, claims_list: List[str]) -> bool:
+        """
+        Checks if the blindspot's description repeats any article claims using token overlap.
+        """
+        if not description or not claims_list:
+            return False
+        import re
+        stop_words = {"the", "a", "an", "and", "or", "but", "to", "of", "in", "on", "at", "for", "with", "is", "was", "were", "are", "be"}
+        def get_words(text: str):
+            return set(w.lower() for w in re.findall(r'\b\w+\b', text) if w.lower() not in stop_words and len(w) > 2)
+        desc_words = get_words(description)
+        if not desc_words:
+            return False
+        for claim in claims_list:
+            claim_words = get_words(claim)
+            if claim_words:
+                overlap = desc_words.intersection(claim_words)
+                if len(overlap) / len(desc_words) > 0.70:
+                    return True
+        return False
+
+    def link_claims_to_blindspots(self, blindspots: List[Blindspot], claims: ClaimAnalysis) -> None:
+        """
+        Maps and links related claims to each blindspot based on token overlap/relevance.
+        """
+        if not blindspots:
+            return
+        if not claims or not claims.key_claims:
+            for bs in blindspots:
+                bs.related_claims = []
+            return
+            
+        import re
+        stop_words = {"the", "a", "an", "and", "or", "but", "to", "of", "in", "on", "at", "for", "with", "is", "was", "were", "are", "be", "this", "that"}
+        def get_words(text: str):
+            return set(w.lower() for w in re.findall(r'\b\w+\b', text) if w.lower() not in stop_words and len(w) > 2)
+            
+        for bs in blindspots:
+            bs.related_claims = []
+            bs_words = get_words(f"{bs.category} {bs.description}")
+            if not bs_words:
+                continue
+            for claim in claims.key_claims:
+                claim_words = get_words(claim)
+                if claim_words:
+                    overlap = bs_words.intersection(claim_words)
+                    if overlap:
+                        bs.related_claims.append(claim)
+            
+            # Safe fallback: if no related claims found, associate the first claim
+            if not bs.related_claims and claims.key_claims:
+                bs.related_claims.append(claims.key_claims[0])
 
     def _make_category_specific(self, category: str, topic: str) -> str:
         cat_lower = category.lower().strip()
@@ -162,11 +270,11 @@ class BlindspotDetector:
             topic_clean = "Policy"
 
         if "enforcement challenges" in cat_lower or "regulatory challenges" in cat_lower:
-            return f"{topic_clean} Enforcement Logistics"
+            return f"{topic_clean} Enforcement Logistics Challenges"
         if "historical outcomes" in cat_lower or "historical context" in cat_lower or "past precedents" in cat_lower:
-            return f"{topic_clean} Historical Precedents"
+            return f"{topic_clean} Historical Policy Precedents"
         if "opposing perspective" in cat_lower or "alternative perspective" in cat_lower or "other perspectives" in cat_lower or "unrepresented viewpoints" in cat_lower or "stakeholder view" in cat_lower:
-            return f"{topic_clean} Stakeholder Gaps"
+            return f"{topic_clean} Omitted Stakeholder Gaps"
         if "economic impact" in cat_lower:
             return f"{topic_clean} Compliance Cost Burden"
         if "expert opinion" in cat_lower:
@@ -174,7 +282,7 @@ class BlindspotDetector:
         if "unintended consequences" in cat_lower:
             return f"{topic_clean} Unintended Policy Spillovers"
         if "transparency" in cat_lower or "governance" in cat_lower:
-            return f"{topic_clean} Governance Transparency"
+            return f"{topic_clean} Governance Transparency Issues"
         if "social impact" in cat_lower:
             return f"{topic_clean} Public Social Impact"
         if "environmental impact" in cat_lower:
@@ -182,9 +290,9 @@ class BlindspotDetector:
         if "policy alternatives" in cat_lower:
             return f"{topic_clean} Alternative Policy Studies"
         if "missing context" in cat_lower:
-            return f"{topic_clean} Background Context"
+            return f"{topic_clean} Essential Background Context"
             
-        return f"{topic_clean} {category.strip()}"
+        return f"{topic_clean} Omitted {category.strip()}"
 
     def build_article_specific_blindspots(
         self,
@@ -208,24 +316,24 @@ class BlindspotDetector:
         if any(w in combined for w in ["vehicle", "car", "emissions", "tax", "gst", "transport", "puc"]):
             categories = [
                 ("Rural Vehicle Owner Burden", "Omitted discussion on the disproportionate compliance cost for rural motorists lacking alternatives.", "High", "rural vehicle owner tax burden"),
-                ("Automobile Industry Impact", "Potential economic disruption and supply chain transition costs for manufacturers.", "Medium", "automobile industry emissions compliance impact"),
-                ("GST Enforcement Complexity", "Administrative hurdles and policy enforcement challenges in graded taxation systems.", "Medium", "GST tax enforcement administrative complexity")
+                ("Automobile Industry Compliance Impact", "Potential economic disruption and supply chain transition costs for manufacturers.", "Medium", "automobile industry emissions compliance impact"),
+                ("GST Tax Enforcement Complexity", "Administrative hurdles and policy enforcement challenges in graded taxation systems.", "Medium", "GST tax enforcement administrative complexity")
             ]
         elif any(w in combined for w in ["neet", "exam", "leak", "coaching", "nta", "test", "coaching"]):
             categories = [
-                ("Student Privacy Implications", "Unresolved student data privacy concerns regarding digital testing and platform communication.", "High", "student privacy digital testing moderation"),
-                ("Coaching Industry Incentives", "Lack of coverage on the commercial incentives of private coaching centers in exam leakage.", "Medium", "coaching industry exam leak incentives"),
+                ("Student Testing Privacy Implications", "Unresolved student data privacy concerns regarding digital testing and platform communication.", "High", "student privacy digital testing moderation"),
+                ("Private Coaching Industry Incentives", "Lack of coverage on the commercial incentives of private coaching centers in exam leakage.", "Medium", "coaching industry exam leak incentives"),
                 ("Regional Inequality in Testing Access", "Disparities in computer-based testing infrastructure between urban and rural centers.", "Medium", "regional inequality testing infrastructure access")
             ]
         elif any(w in combined for w in ["climate", "carbon", "renewable", "energy", "solar", "wind", "coal", "grid", "mining"]):
             categories = [
-                ("Grid Reliability Gaps", "Omitted discussion on grid instability and power outages under high renewable penetration.", "High", "grid reliability renewable energy intermittency"),
+                ("Renewable Grid Reliability Gaps", "Omitted discussion on grid instability and power outages under high renewable penetration.", "High", "grid reliability renewable energy intermittency"),
                 ("Rare Earth Metals Cost", "Ecological footprint and human costs of mining rare earth metals for clean tech.", "Medium", "rare earth metals environmental mining cost"),
                 ("Local Utility Transition Costs", "Financial burden on local energy providers adapting to green infrastructure mandates.", "Medium", "utility providers clean energy transition cost")
             ]
         elif any(w in combined for w in ["education", "school", "budget", "teacher", "curriculum", "learn"]):
             categories = [
-                ("Teacher Salary Allocation", "Lack of details on budget adjustments for public educator salaries and benefits.", "High", "teacher salary education budget allocation"),
+                ("Teacher Salary Budget Allocation", "Lack of details on budget adjustments for public educator salaries and benefits.", "High", "teacher salary education budget allocation"),
                 ("Rural School Funding Disparities", "Disproportionate resource distribution leaving remote school districts behind.", "Medium", "rural school funding allocation gap"),
                 ("Student Digital Access Barriers", "Hurdles in infrastructure, devices, and internet access for disadvantaged learners.", "Medium", "disadvantaged student educational technology access barriers")
             ]
@@ -249,14 +357,14 @@ class BlindspotDetector:
                 entity = "Policy"
 
             categories = [
-                (f"{entity} Implementation Challenges", f"Operational hurdles and logistical complexities in implementing {entity}.", "High", f"{entity.lower()} implementation challenges"),
+                (f"{entity} Primary Implementation Challenges", f"Operational hurdles and logistical complexities in implementing {entity}.", "High", f"{entity.lower()} implementation challenges"),
                 (f"{entity} Stakeholder Economic Impact", f"Compliance cost burdens and transition overheads for affected groups of {entity}.", "Medium", f"{entity.lower()} stakeholder economic transition impact"),
                 (f"{entity} Legal Policy Precedents", f"Omission of comparative outcomes and regulatory legal precedents for {entity}.", "Medium", f"{entity.lower()} policy legal precedents")
             ]
 
         blindspots = []
         for cat, desc, imp, query in categories[:3]:
-            if self._is_generic_category(cat):
+            if self.is_generic_blindspot(cat, title=article_title, topic=topic) or len(cat.split()) < 4:
                 cat = self._make_category_specific(cat, topic)
             blindspots.append(
                 Blindspot(
@@ -267,6 +375,7 @@ class BlindspotDetector:
                 )
             )
 
+        self.link_claims_to_blindspots(blindspots, claims)
         return blindspots
 
     def _get_deterministic_blindspots(self, article: ArticleData, claims: ClaimAnalysis) -> List[Blindspot]:
@@ -301,6 +410,7 @@ class BlindspotDetector:
             # 2. Verify Ollama availability and model via pre-call check
             if not self.ollama_client.pre_call_health_check(self.config.MODEL_BLINDSPOT_DETECTOR):
                 self.logger.warning("Ollama pre-call health check failed. Skipping LLM blindspot detection and using deterministic fallback.")
+                self.link_claims_to_blindspots(fallback_blindspots, claims)
                 return fallback_blindspots
 
             # 3. Build prompts:
@@ -312,7 +422,7 @@ class BlindspotDetector:
                 prompt=analysis_prompt,
                 system_prompt=system_prompt,
                 temperature=0.2,
-                num_predict=192,
+                num_predict=256,
                 model=self.config.MODEL_BLINDSPOT_DETECTOR,
                 timeout=60.0
             )
@@ -334,11 +444,17 @@ class BlindspotDetector:
                     if not isinstance(item, dict):
                         continue
                     cat = str(item.get("category", "")).strip()
-                    if self._is_generic_category(cat):
+                    
+                    # Reject if category length is less than 4 words
+                    if len(cat.split()) < 4:
+                        self.logger.info(f"Rejected blindspot reason: category '{cat}' has fewer than 4 words.")
+                        continue
+                        
+                    if self.is_generic_blindspot(cat, article):
                         self.logger.info(f"Rejected blindspot reason: '{cat}' is generic. Attempting to make specific.")
                         cat = self._make_category_specific(cat, topic_str)
-                        if self._is_generic_category(cat):
-                            self.logger.info(f"Rejected blindspot reason: '{cat}' is generic.")
+                        if self.is_generic_blindspot(cat, article) or len(cat.split()) < 4:
+                            self.logger.info(f"Rejected blindspot reason: '{cat}' is generic or too short after specifier.")
                             continue
                     
                     if self._is_too_similar(cat, topic_str, claims_text_list):
@@ -346,6 +462,10 @@ class BlindspotDetector:
                         continue
                         
                     desc = str(item.get("description", "")).strip()
+                    if self.description_repeats_claims(desc, claims_text_list):
+                        self.logger.info(f"Rejected blindspot reason: description '{desc}' repeats article claims.")
+                        continue
+                        
                     imp = str(item.get("importance", "Medium")).strip()
                     query = str(item.get("suggested_search_query", "")).strip()
                     if not cat or not desc:
@@ -362,12 +482,12 @@ class BlindspotDetector:
 
             blindspots = parse_response_to_blindspots(response)
             
-            # Check if valid (exactly 2 or 3 blindspots, none generic, none too similar)
-            has_generic = any(self._is_generic_category(bs.category) for bs in blindspots)
+            # Check if valid (3 to 5 blindspots, none generic, none too similar)
+            has_generic = any(self.is_generic_blindspot(bs.category, article) for bs in blindspots)
             claims_text_list = claims.key_claims if claims else []
             topic_str = claims.main_topic if claims else article.title
             has_too_similar = any(self._is_too_similar(bs.category, topic_str, claims_text_list) for bs in blindspots)
-            is_valid = len(blindspots) in (2, 3) and not has_generic and not has_too_similar
+            is_valid = 3 <= len(blindspots) <= 5 and not has_generic and not has_too_similar
 
             if not is_valid:
                 self.logger.warning("Generated blindspots are generic, empty, too similar, or wrong count. Regenerating once.")
@@ -376,7 +496,7 @@ class BlindspotDetector:
                     prompt=analysis_prompt,
                     system_prompt=system_prompt,
                     temperature=0.4,
-                    num_predict=192,
+                    num_predict=256,
                     model=self.config.MODEL_BLINDSPOT_DETECTOR,
                     timeout=60.0
                 )
@@ -384,14 +504,27 @@ class BlindspotDetector:
                 blindspots = parse_response_to_blindspots(response)
                 
                 # Check again. If still invalid, use deterministic fallback
-                has_generic = any(self._is_generic_category(bs.category) for bs in blindspots)
+                has_generic = any(self.is_generic_blindspot(bs.category, article) for bs in blindspots)
                 has_too_similar = any(self._is_too_similar(bs.category, topic_str, claims_text_list) for bs in blindspots)
-                is_valid = len(blindspots) in (2, 3) and not has_generic and not has_too_similar
+                is_valid = 3 <= len(blindspots) <= 5 and not has_generic and not has_too_similar
                 if not is_valid:
                     self.logger.warning("Regenerated blindspots are still generic, too similar, or invalid. Applying deterministic fallback.")
-                    return fallback_blindspots
+                    blindspots = fallback_blindspots
 
-            blindspots = blindspots[:3]
+            # Supplement if count < 3
+            if len(blindspots) < 3:
+                self.logger.info(f"Supplementing blindspots from fallback. Current count: {len(blindspots)}")
+                for fb in fallback_blindspots:
+                    if fb.category not in [b.category for b in blindspots]:
+                        blindspots.append(fb)
+                        if len(blindspots) >= 3:
+                            break
+            # Force exactly between 3 and 5
+            if len(blindspots) < 3:
+                blindspots = fallback_blindspots[:3]
+
+            blindspots = blindspots[:5]
+            self.link_claims_to_blindspots(blindspots, claims)
 
             # 10. Log:
             self.logger.info(f"Detected {len(blindspots)} blindspots")
@@ -400,6 +533,7 @@ class BlindspotDetector:
         except Exception as error:
             # 12. Error Handling
             self.logger.error(f"Blindspot detection failed: {error}. Returning fallback.")
+            self.link_claims_to_blindspots(fallback_blindspots, claims)
             return fallback_blindspots
 
 if __name__ == "__main__":

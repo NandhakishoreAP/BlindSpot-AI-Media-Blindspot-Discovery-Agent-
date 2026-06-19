@@ -110,10 +110,11 @@ Your job is to evaluate search results and determine:
             '    "relevance": "Supports | Contradicts | Adds Context",\n'
             '    "relevance_score": 0-100 integer score (High if it addresses a blindspot, contradicts framing, or provides missing context; Low if it repeats article claims or is irrelevant),\n'
             '    "quality": "High | Medium | Low",\n'
-            '    "key_insight": "1-sentence summary"\n'
+            '    "key_insight": "1-sentence summary",\n'
+            '    "evidence_summary": "1-2 sentence explanation of how this search result relates to the article and the blindspot"\n'
             "  }\n"
             "]\n"
-            "IMPORTANT: Keep all text values extremely concise (max 10 words) to avoid truncation. "
+            "IMPORTANT: Keep all text values extremely concise. "
             "No explanations or markdown blocks."
         )
         return prompt
@@ -138,7 +139,7 @@ Your job is to evaluate search results and determine:
             
             # 2. Key insight: truncate snippet or title to a clean concise sentence
             insight = res.snippet[:120] if res.snippet else "Relevant search result data"
-            if len(insight) < 10 and res.title:
+            if len(insight) < 15 and res.title:
                 insight = res.title[:120]
                 
             # 3. Determine relevance: check for contradiction keywords
@@ -166,13 +167,17 @@ Your job is to evaluate search results and determine:
                 
             # If it covers a blindspot
             addresses_blindspot = False
+            matched_bs_cat = ""
             for bs in blindspots:
-                if self.check_semantic_coverage(bs.category, insight):
+                if self.check_semantic_coverage(bs.category, insight) or (res.snippet and self.check_semantic_coverage(bs.category, res.snippet)):
                     addresses_blindspot = True
+                    matched_bs_cat = bs.category
                     break
-            if addresses_blindspot:
-                score += 20
+            if not addresses_blindspot:
+                self.logger.info(f"Heuristic evidence discarded: cannot be linked to any blindspot for URL={res.url}")
+                continue
                 
+            score += 20
             score = max(0, min(100, score))
             
             ev = Evidence(
@@ -180,7 +185,9 @@ Your job is to evaluate search results and determine:
                 relevance=relevance,
                 quality=quality,
                 key_insight=insight,
-                relevance_score=score
+                relevance_score=score,
+                evidence_summary=f"External source confirms details and {relevance.lower()} the topic. It provides key insight: {insight}",
+                related_blindspot=matched_bs_cat
             )
             self.logger.info(
                 f"Heuristic Evidence created: quality={ev.quality}, relevance={ev.relevance}, score={score}"
@@ -732,8 +739,8 @@ Your job is to evaluate search results and determine:
             key_insight = item.get("key_insight", "")
             key_insight_str = str(key_insight).strip() if key_insight is not None else ""
 
-            # 1. Insight length check
-            if len(key_insight_str) < 10:
+            # 1. Insight length check (Reject if < 15 chars)
+            if len(key_insight_str) < 15:
                 self.logger.info(f"Rejected evidence reason: insight too short ('{key_insight_str}') for URL={search_results_sliced[index].url}")
                 continue
                 
@@ -758,7 +765,7 @@ Your job is to evaluate search results and determine:
                 self.logger.info(f"Rejected evidence reason: generic statement ('{key_insight_str}') for URL={search_results_sliced[index].url}")
                 continue
                 
-            # 3. Duplicate check against candidate_evidence
+            # 3. Duplicate check against candidate_evidence (ratio > 0.80)
             from difflib import SequenceMatcher
             is_duplicate = False
             for existing in candidate_evidence:
@@ -766,7 +773,7 @@ Your job is to evaluate search results and determine:
                     is_duplicate = True
                     break
                 ratio = SequenceMatcher(None, existing.key_insight.lower(), key_insight_str.lower()).ratio()
-                if ratio > 0.70:
+                if ratio > 0.80:
                     is_duplicate = True
                     break
             if is_duplicate:
@@ -851,9 +858,38 @@ Your job is to evaluate search results and determine:
                 self.logger.info(f"Rejected duplicate/low-value evidence: URL={search_results_sliced[index].url}")
                 continue
 
+            # 1. Check required fields
+            url_val = search_results_sliced[index].url
+            try:
+                domain_val = urlparse(url_val).netloc
+                if domain_val.startswith("www."):
+                    domain_val = domain_val[4:]
+            except Exception:
+                domain_val = ""
+                
+            evidence_summary = str(item.get("evidence_summary", "")).strip()
+            if not evidence_summary:
+                evidence_summary = f"External source confirms details and {relevance.lower()} the topic. It provides key insight: {key_insight_str}"
+                
+            if not url_val or not domain_val or not key_insight_str or not relevance or not evidence_summary:
+                self.logger.warning(f"Discarding evidence due to missing required fields: URL={url_val}")
+                continue
+
             # relevance validation:
             if not self._is_evidence_relevant(key_insight_str, search_results_sliced[index], claims, blindspots):
                 self.logger.info(f"Rejected evidence reason: no relation to topic for URL={search_results_sliced[index].url}")
+                continue
+
+            # Evidence-to-Blindspot Mapping constraint:
+            mapped_to_blindspot = False
+            matched_bs_cat = ""
+            for bs in blindspots:
+                if self.check_semantic_coverage(bs.category, key_insight_str) or self.check_semantic_coverage(bs.category, search_results_sliced[index].snippet):
+                    mapped_to_blindspot = True
+                    matched_bs_cat = bs.category
+                    break
+            if not mapped_to_blindspot:
+                self.logger.info(f"Discarding evidence (cannot be linked to any blindspot): URL={search_results_sliced[index].url}")
                 continue
 
             evidence_obj = Evidence(
@@ -861,7 +897,9 @@ Your job is to evaluate search results and determine:
                 relevance=relevance,
                 quality=quality,
                 key_insight=key_insight_str,
-                relevance_score=relevance_score
+                relevance_score=relevance_score,
+                evidence_summary=evidence_summary,
+                related_blindspot=matched_bs_cat
             )
             self.logger.info(
                 f"Evidence created: quality={evidence_obj.quality}, relevance={evidence_obj.relevance}, score={relevance_score}"
@@ -909,6 +947,26 @@ Your job is to evaluate search results and determine:
 
         self.logger.info(f"Selected {len(evidence_items)} evidence items from {len(search_results_sliced)} search results")
         return evidence_items
+
+    def _is_generic_category(self, category: str) -> bool:
+        if not category:
+            return True
+        generic_list = [
+            "opposing perspective", "historical context", "economic impact", "expert opinion",
+            "stakeholder view", "alternative perspective", "enforcement challenges", "historical outcomes",
+            "unintended consequences", "missing context", "transparency", "social impact",
+            "environmental impact", "governance", "policy alternatives", "other perspectives",
+            "unrepresented viewpoints", "regulatory challenges", "community engagement",
+            "social concerns", "public opinion", "stakeholder response"
+        ]
+        cat_lower = category.lower().strip()
+        for gen in generic_list:
+            if cat_lower == gen or gen in cat_lower:
+                return True
+        for suffix in ["implementation challenges", "stakeholder economic impact", "legal policy precedents", "primary implementation challenges"]:
+            if suffix in cat_lower:
+                return True
+        return False
 
     def get_confidence_details(
         self,
@@ -1018,46 +1076,58 @@ Your job is to evaluate search results and determine:
         raw_score = quality_score + coverage_points + diversity_points + contradiction_bonus + agreement_bonus
         score_val = int(raw_score)
 
-        # Apply strict realistic caps (Issue 5 & Quality Logging Issue 10):
-        if len(evidence) < 3:
-            if score_val > 50:
-                self.logger.info(f"Confidence cap applied: evidence < 3 -> cap 50 (raw score: {score_val})")
-                score_val = 50
-        elif len(evidence) < 5:
-            if score_val > 70:
-                self.logger.info(f"Confidence cap applied: evidence < 5 -> cap 70 (raw score: {score_val})")
-                score_val = 70
-                
+        # Apply Penalties:
+        # 1. Generic blindspots penalty (-15)
+        has_generic = any(self._is_generic_category(bs.category) for bs in blindspots)
+        if has_generic:
+            score_val -= 15
+            self.logger.info("Penalty applied: generic blindspots (-15)")
+            
+        # 2. Low source diversity (-10)
+        if unique_domains_count <= 1 and len(evidence) >= 2:
+            score_val -= 10
+            self.logger.info("Penalty applied: low source diversity (-10)")
+            
+        # 3. Weak coverage (< 50% coverage, -15)
+        if coverage_ratio < 0.5:
+            score_val -= 15
+            self.logger.info("Penalty applied: weak coverage (< 50% coverage, -15)")
+            
+        # 4. Weak relevance penalty (-15)
+        avg_relevance_score = sum(ev.relevance_score for ev in evidence) / len(evidence) if evidence else 0
+        if len(evidence) > 0 and avg_relevance_score < 55:
+            score_val -= 15
+            self.logger.info("Penalty applied: weak relevance (-15)")
+
+        # Apply strict realistic caps (Revised Caps from User request):
+        if len(evidence) == 1:
+            score_val = min(score_val, 40)
+            self.logger.info(f"Confidence cap applied: 1 evidence -> cap 40")
+        elif len(evidence) == 2:
+            score_val = min(score_val, 60)
+            self.logger.info(f"Confidence cap applied: 2 evidence -> cap 60")
+        elif len(evidence) == 3:
+            score_val = min(score_val, 80)
+            self.logger.info(f"Confidence cap applied: 3 evidence -> cap 80")
+        elif len(evidence) >= 4:
+            score_val = min(score_val, 95)
+            self.logger.info(f"Confidence cap applied: 4+ evidence -> cap 95")
+
         if coverage_ratio < 1.0:
             if score_val > 80:
-                self.logger.info(f"Confidence cap applied: coverage < 1.0 -> cap 80 (raw score: {score_val})")
-                score_val = 80
+                self.logger.info(f"Confidence cap applied: coverage < 1.0 -> cap 80")
+                score_val = min(score_val, 80)
                 
         if high_q_count == 0:
             if score_val > 65:
-                self.logger.info(f"Confidence cap applied: high_quality == 0 -> cap 65 (raw score: {score_val})")
-                score_val = 65
+                self.logger.info(f"Confidence cap applied: high_quality == 0 -> cap 65")
+                score_val = min(score_val, 65)
 
-        # Absolute maximum cap
-        if score_val > 90:
-            self.logger.info(f"Confidence cap applied: absolute maximum -> cap 90 (raw score: {score_val})")
-            score_val = 90
-
-        # Maintain specific low count caps
-        if len(evidence) == 1:
-            score_val = min(score_val, 30)
-        elif len(evidence) == 2:
-            score_val = min(score_val, 50)
-            
         # B. Repetitive sources cap (unique domains <= 1 and count >= 2)
         if unique_domains_count <= 1 and len(evidence) >= 2:
             score_val = min(score_val, 40)
             
-        # C. Incomplete blindspot coverage cap (< 50% coverage)
-        if coverage_ratio < 0.5:
-            score_val = min(score_val, 60)
-            
-        # D. Zero coverage cap (if coverage == 0, cap at 20, or 35 if quality & diversity are strong)
+        # D. Zero coverage cap
         has_strong_qd = False
         if covered_blindspots == 0:
             has_strong_qd = (unique_domains_count >= 2 and (high_q_count >= 1 or (high_q_count + medium_q_count) >= 2))

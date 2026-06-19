@@ -21,15 +21,18 @@ class ArticleData(BaseModel):
 
 class ClaimAnalysis(BaseModel):
     """
-    Holds structural analysis of key assertions, tone, and framing of an article.
+    Analyzes the main claims, stance, and tone of the article.
     """
     main_topic: str
     key_claims: List[str]
     author_stance: str
     tone: str
     framing_summary: str
+    claim_confidences: List[int] = Field(default_factory=list)
+    source_sentences: List[str] = Field(default_factory=list)
 
 class Blindspot(BaseModel):
+    entity: Optional[str] = None
     """
     Identifies a missing perspective or factual gaps within the original article, 
     with query guidance to verify it.
@@ -38,6 +41,8 @@ class Blindspot(BaseModel):
     description: str
     importance: str
     suggested_search_query: str
+    related_claims: List[str] = Field(default_factory=list)
+    related_entities: List[str] = Field(default_factory=list)
 
 class SearchResult(BaseModel):
     """
@@ -50,6 +55,8 @@ class SearchResult(BaseModel):
     source: str = "DuckDuckGo"
 
 class Evidence(BaseModel):
+    linked_claim: Optional[str] = None
+    linked_blindspot: Optional[str] = None
     """
     Pairs a search result with evaluations on how it relates to original claims.
     """
@@ -97,6 +104,7 @@ class PlannerDecision(BaseModel):
     """
     action: str
     queries: List[str] = Field(default_factory=list)
+    claim_confidences: List[int] = Field(default_factory=list)
     reasoning: str
 
 class BlindspotReport(BaseModel):
