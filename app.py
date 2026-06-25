@@ -1,10 +1,13 @@
+import logging
 import streamlit as st
 import json
+import os
 import time
 import traceback
 import threading
 from pathlib import Path
-from datetime import datetime
+
+logger = logging.getLogger(__name__)
 from config import Config
 from agent.orchestrator import MediaBlindspotAgent
 from models.data_models import BlindspotReport
@@ -34,7 +37,8 @@ class DictAttrProxy(dict):
 def load_safe_report(rep_dict: dict):
     try:
         return BlindspotReport(**rep_dict)
-    except Exception:
+    except Exception as e:
+        logger.warning(f"Report load failed ({__file__}:36): {e}")
         return DictAttrProxy(rep_dict)
 
 # Page Config MUST be the first Streamlit command
@@ -81,11 +85,11 @@ st.markdown(
     /* Dashboard Cards */
     .dashboard-card {
         background-color: var(--bg-card);
-        border-radius: 8px;
-        padding: 18px 24px;
+        border-radius: 10px;
+        padding: 20px 28px;
         border: 1px solid var(--border);
-        margin-bottom: 20px;
-        box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05);
+        margin-bottom: 24px;
+        box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
         transition: border-color 0.2s ease, box-shadow 0.2s ease;
     }
     .dashboard-card:hover {
@@ -93,17 +97,60 @@ st.markdown(
     }
     
     /* Typography */
-    h1, h2, h3, h4, h5 {
+    h1, h2, h3, h4, h5, h6 {
         font-weight: 600;
         color: var(--text-primary);
         letter-spacing: -0.02em;
+        margin-top: 1.2em;
+        margin-bottom: 0.6em;
+    }
+    h1 { font-size: 2.25rem; }
+    h2 { font-size: 1.75rem; }
+    h3 { font-size: 1.35rem; }
+    h4 { font-size: 1.1rem; }
+    
+    /* Streamlit heading overrides for consistency */
+    .stMarkdown h1, .stMarkdown h2, .stMarkdown h3, .stMarkdown h4 {
+        margin-top: 1.2em !important;
+        margin-bottom: 0.6em !important;
+    }
+    
+    /* Report section headings larger */
+    .report-section-heading {
+        font-size: 1.25rem;
+        font-weight: 600;
+        margin-bottom: 16px;
+        padding-bottom: 8px;
+        border-bottom: 1px solid var(--border);
+        color: var(--text-primary);
+    }
+    
+    /* Evidence cards */
+    .evidence-card {
+        background-color: var(--bg-secondary);
+        border-radius: 8px;
+        padding: 16px 20px;
+        margin-bottom: 12px;
+        border: 1px solid var(--border);
+    }
+    
+    /* Score display */
+    .score-large {
+        font-size: 3rem;
+        font-weight: 700;
+        line-height: 1;
+    }
+    .score-unit {
+        font-size: 1.2rem;
+        color: var(--text-secondary);
+        font-weight: 400;
     }
     
     /* Badges */
     .badge {
         display: inline-block;
-        padding: 2px 8px;
-        border-radius: 4px;
+        padding: 3px 10px;
+        border-radius: 5px;
         font-size: 0.75rem;
         font-weight: 500;
         letter-spacing: 0.02em;
@@ -136,6 +183,21 @@ st.markdown(
     .recent-reports-container::-webkit-scrollbar-thumb:hover {
         background: var(--text-secondary);
     }
+    
+    /* Confidence display bar */
+    .confidence-bar-container {
+        width: 100%;
+        height: 8px;
+        background-color: var(--bg-secondary);
+        border-radius: 4px;
+        overflow: hidden;
+        margin: 8px 0;
+    }
+    .confidence-bar-fill {
+        height: 100%;
+        border-radius: 4px;
+        transition: width 0.5s ease;
+    }
     </style>
     """,
     unsafe_allow_html=True
@@ -154,6 +216,7 @@ if "url_input_value" not in st.session_state:
     st.session_state.url_input_value = ""
 if "current_ui_status" not in st.session_state:
     st.session_state.current_ui_status = "Initializing"
+
 
 # Get Agent Function
 def get_agent() -> MediaBlindspotAgent:
@@ -189,7 +252,8 @@ def get_full_report_data(report) -> dict:
             rep_obj = data.get("report", {})
             if rep_obj.get("article_url") == url_to_match:
                 return data
-        except Exception:
+        except Exception as e:
+            logger.warning(f"Report data read failed ({__file__}:250): {e}")
             continue
     return {}
 
@@ -248,19 +312,15 @@ with st.sidebar:
     st.markdown("## BlindSpot AI")
     st.markdown("---")
     
-    # Settings Section
-    st.markdown("### Settings")
-    dev_mode = False
+    # System Status Section (read-only)
     try:
         config = Config.from_env()
-        st.text_input("Model", value=config.OLLAMA_MODEL, disabled=True)
-        st.number_input("Confidence Threshold", value=config.CONFIDENCE_THRESHOLD, disabled=True)
-        st.number_input("Max Search Attempts", value=config.MAX_SEARCH_ATTEMPTS, disabled=True)
-        debug_mode_config = getattr(config, "DEBUG_MODE", False)
-        dev_mode = st.checkbox("Developer Mode", value=debug_mode_config)
-    except Exception:
-        st.warning("Failed to load settings configuration.")
-        dev_mode = st.checkbox("Developer Mode", value=False)
+        model = config.OLLAMA_MODEL
+        status = "Active" if config.OLLAMA_BASE_URL else "Inactive"
+        dev_mode = debug_mode_env = getattr(config, "DEBUG_MODE", False) or os.environ.get("DEBUG_MODE", "").lower() in ("1", "true")
+    except Exception as e:
+        logger.warning(f"System status check failed ({__file__}:336): {e}")
+        dev_mode = False
         
     st.markdown("---")
     
@@ -280,7 +340,8 @@ with st.sidebar:
                 score = rep_obj.get("blindspot_score", "N/A")
                 date = rep_obj.get("analysis_timestamp", "")[:10]
                 url_to_match = rep_obj.get("article_url", "")
-            except Exception:
+            except Exception as e:
+                logger.warning(f"Report title read failed ({__file__}:358): {e}")
                 title = rf.name
                 score = "Error"
                 date = ""
@@ -330,9 +391,85 @@ with st.sidebar:
                     if st.button("Delete", key=f"del_{idx}_{rf.name}", use_container_width=True):
                         st.session_state.delete_confirm = rf
                         st.rerun()
-            st.markdown("<div style='margin-bottom: 12px;'></div>", unsafe_allow_html=True)
+            st.markdown("")
         st.markdown('</div>', unsafe_allow_html=True)
+    
+    # System Status (clean table, below recent reports)
+    st.markdown("### System Status")
+    try:
+        config_sys = Config.from_env()
         
+        # Get active model info from agent if available
+        agent_obj = st.session_state.get("agent")
+        if agent_obj and hasattr(agent_obj, "ollama_client") and agent_obj.ollama_client:
+            active_model = agent_obj.ollama_client.model
+            if hasattr(agent_obj, "ollama_available"):
+                model_available = agent_obj.ollama_available
+            else:
+                model_available = False
+        else:
+            active_model = config_sys.OLLAMA_MODEL
+            model_available = False
+        
+        model_status = "Available" if model_available else "Unavailable"
+        model_status_color = "var(--success)" if model_available else "var(--danger)"
+        
+        search_status = "Active" if config_sys.OLLAMA_BASE_URL else "Inactive"
+        runtime_budget = f"{getattr(config_sys, 'MAX_RESEARCH_SECONDS', 90)} sec"
+        
+        # Last analysis result
+        last_report = st.session_state.get("report")
+        last_error = st.session_state.get("error")
+        if last_report:
+            reason = getattr(last_report, "completion_reason", "completed")
+            score = getattr(last_report, "blindspot_score", 0)
+            if reason in ("system_error", "model_unavailable"):
+                last_result = f"Failed ({reason})"
+                last_result_color = "var(--danger)"
+            elif reason in ("empty_content", "access_restricted", "metadata_only", "extraction_failed"):
+                last_result = f"Aborted ({reason})"
+                last_result_color = "var(--warning)"
+            else:
+                last_result = f"Score: {score}/100"
+                last_result_color = "var(--success)"
+        elif last_error:
+            last_result = "Failed"
+            last_result_color = "var(--danger)"
+        else:
+            last_result = "None"
+            last_result_color = "var(--text-secondary)"
+        
+        st.markdown(
+            f"""
+            <div style="font-size:0.85rem; line-height:1.6;">
+                <div style="display:flex; justify-content:space-between; padding:2px 0; border-bottom: 1px solid var(--border);">
+                    <span style="color:var(--text-secondary);">Active Model</span>
+                    <span style="color:var(--text-primary);">{active_model}</span>
+                </div>
+                <div style="display:flex; justify-content:space-between; padding:2px 0; border-bottom: 1px solid var(--border);">
+                    <span style="color:var(--text-secondary);">Model Status</span>
+                    <span style="color:{model_status_color};">{model_status}</span>
+                </div>
+                <div style="display:flex; justify-content:space-between; padding:2px 0; border-bottom: 1px solid var(--border);">
+                    <span style="color:var(--text-secondary);">Search Engine</span>
+                    <span style="color:var(--accent);">{search_status}</span>
+                </div>
+                <div style="display:flex; justify-content:space-between; padding:2px 0; border-bottom: 1px solid var(--border);">
+                    <span style="color:var(--text-secondary);">Runtime Budget</span>
+                    <span style="color:var(--text-primary);">{runtime_budget}</span>
+                </div>
+                <div style="display:flex; justify-content:space-between; padding:2px 0;">
+                    <span style="color:var(--text-secondary);">Last Analysis</span>
+                    <span style="color:{last_result_color};">{last_result}</span>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+    except Exception as e:
+        logger.warning(f"System status check failed ({__file__}:336): {e}")
+        st.warning("Status unavailable")
+    
     st.markdown("---")
     
     # About Section (Collapsed by default)
@@ -512,9 +649,6 @@ def display_error(error_dict):
 if st.session_state.error:
     display_error(st.session_state.error)
 
-# ----------------------------------------------------
-# MAIN VIEW STATES
-# ----------------------------------------------------
 if st.session_state.report is None:
     # Onboarding Empty State Screen
     st.markdown(
@@ -531,7 +665,7 @@ if st.session_state.report is None:
     )
     
     # Render buttons in a centered content layout
-    c_outer_l, c_content, c_outer_r = st.columns([1.5, 7, 1.5])
+    _, c_content, _ = st.columns([1.5, 7, 1.5])
     with c_content:
         c_s1, c_s2, c_s3 = st.columns(3)
         s1_url = "https://www.thedailystar.net/opinion/views/news/promises-and-pitfalls-the-new-education-budget-4199791"
@@ -559,22 +693,25 @@ else:
     url_short = url[:60] if len(url) > 60 else url
     date_str = getattr(report, 'analysis_timestamp', 'N/A')[:10]
     
+    # Confidence bar color
+    conf_color = "#0eb383" if confidence >= 70 else "#e59c24" if confidence >= 40 else "#f85c63"
+
     st.markdown(
         f"""
-        <div class="dashboard-card" style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 16px; margin-top: 20px;">
-            <div style="flex: 2; min-width: 300px;">
-                <div style="font-size: 0.75rem; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 4px;">Target Article</div>
-                <h3 style="margin: 0 0 6px 0; font-size: 1.15rem; font-weight: 600; line-height: 1.3; color: var(--text-primary);">{title}</h3>
-                <div style="font-size: 0.8rem;"><a href="{url}" target="_blank" style="color: var(--accent); text-decoration: none; word-break: break-all;">{url_short}...</a></div>
-            </div>
-            <div style="display: flex; gap: 24px; flex-wrap: wrap; align-items: center;">
+        <div class="dashboard-card" style="margin-top: 20px;">
+            <div style="font-size: 0.75rem; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 8px;">Target Article</div>
+            <div style="font-size: 1.15rem; font-weight: 600; line-height: 1.3; color: var(--text-primary); margin-bottom: 4px;">{title}</div>
+            <div style="font-size: 0.8rem; margin-bottom: 16px;"><a href="{url}" target="_blank" style="color: var(--accent); text-decoration: none; word-break: break-all;">{url_short}</a></div>
+            <div style="display: flex; gap: 32px; flex-wrap: wrap;">
                 <div>
                     <div style="font-size: 0.75rem; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 2px;">Analysis Date</div>
                     <div style="font-weight: 600; font-size: 0.9rem; color: var(--text-primary);">{date_str}</div>
                 </div>
-                <div>
-                    <div style="font-size: 0.75rem; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 2px;">Confidence</div>
-                    <div style="font-weight: 600; font-size: 0.9rem; color: var(--text-primary);">{confidence}%</div>
+                <div style="flex:1; min-width: 160px;">
+                    <div style="font-size: 0.75rem; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 2px;">Confidence: {confidence}%</div>
+                    <div class="confidence-bar-container">
+                        <div class="confidence-bar-fill" style="width: {confidence}%; background-color: {conf_color};"></div>
+                    </div>
                 </div>
                 <div>
                     <div style="font-size: 0.75rem; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 2px;">Evidence Strength</div>
@@ -638,7 +775,7 @@ else:
     searches = search_metrics.get("searches_executed", getattr(report, "search_attempts", 0)) if isinstance(search_metrics, dict) else getattr(report, "search_attempts", 0)
     evidence_count = getattr(report, "evidence_count", 0)
 
-    st.markdown("#### Key Findings")
+    st.markdown('<div class="report-section-heading">Key Findings</div>', unsafe_allow_html=True)
     st.markdown(
         f"""
         <div class="dashboard-card" style="padding: 20px; display: flex; justify-content: space-around; align-items: center; flex-wrap: wrap; gap: 16px; text-align: center;">
@@ -674,7 +811,7 @@ else:
                 st.markdown(f"**{idx}.** {c}")
 
     # 4. Missing Perspectives Accordion list
-    st.markdown("#### Missing Perspectives")
+    st.markdown('<div class="report-section-heading">Missing Perspectives</div>', unsafe_allow_html=True)
     blindspots = getattr(report, "blindspots", [])
     if not blindspots:
         st.info("No blindspots identified.")
@@ -698,7 +835,7 @@ else:
                         st.markdown(f"- {claim}")
 
     # 5. Evidence Analysis (HTML Table & Badges & Expand Details)
-    st.markdown("#### Evidence Analysis")
+    st.markdown('<div class="report-section-heading">Evidence Analysis</div>', unsafe_allow_html=True)
     full_report_data = get_full_report_data(report)
     metadata_dict = full_report_data.get("metadata", {})
     evidence_list = metadata_dict.get("evidence", [])
@@ -711,37 +848,55 @@ else:
         else:
             for idx, ev in enumerate(evidence_list):
                 source = ev.get("search_result", {}).get("source", "Reference")
-                url = ev.get("search_result", {}).get("url", "")
+                src_url = ev.get("search_result", {}).get("url", "")
                 relevance = ev.get("relevance", "Adds Context")
                 quality = ev.get("quality", "Medium")
                 insight = ev.get("key_insight", "")
                 evidence_sum = ev.get("evidence_summary", "")
                 related_bs = ev.get("related_blindspot", "")
                 
-                with st.container(border=True):
-                    col1, col2 = st.columns([3, 1])
-                    with col1:
-                        st.markdown(f"### {source}")
-                    with col2:
-                        st.markdown(f"**Relevance:** {relevance}  \n**Quality:** {quality}")
-                    
-                    st.markdown(f"**Key Insight:** {insight}")
-                    if evidence_sum:
-                        st.markdown(f"**Summary:** {evidence_sum}")
-                    
-                    col3, col4 = st.columns([3, 1])
-                    with col3:
-                        st.caption(f"Linked Perspective Gap: {related_bs if related_bs else 'Unlinked'}")
-                    with col4:
-                        if url:
-                            st.markdown(f"[View Source ↗]({url})")
+                st.markdown(
+                    f"""
+                    <div class="evidence-card">
+                        <div style="display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 8px;">
+                            <div style="font-weight: 600; font-size: 1rem; color: var(--text-primary);">{source}</div>
+                            <div style="display: flex; gap: 8px;">
+                                <span class="badge badge-accent">{relevance}</span>
+                                <span class="badge badge-warning">{quality}</span>
+                            </div>
+                        </div>
+                        <div style="color: var(--text-primary); font-size: 0.9rem; margin-bottom: 6px;"><strong>Key Insight:</strong> {insight}</div>
+                        {f'<div style="color: var(--text-secondary); font-size: 0.85rem; margin-bottom: 4px;"><strong>Summary:</strong> {evidence_sum}</div>' if evidence_sum else ''}
+                        <div style="display: flex; justify-content: space-between; align-items: center; font-size: 0.8rem; color: var(--text-secondary);">
+                            <span>Linked Perspective: {related_bs if related_bs else 'Unlinked'}</span>
+                            {f'<a href="{src_url}" target="_blank" style="color: var(--accent); text-decoration: none;">View Source ↗</a>' if src_url else ''}
+                        </div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True
+                )
+
 
     # 6. Conclusion (Clean panel, readable, no borders)
-    st.markdown("#### Conclusion")
+    st.markdown('<div class="report-section-heading">Conclusion</div>', unsafe_allow_html=True)
+    conclusion_text = getattr(report, 'balanced_conclusion', '')
+    # Format: ensure headers are bold, no ### visible, consistent spacing
+    formatted_conclusion = conclusion_text
+    import re
+    # Replace plain header lines with styled versions
+    headers = ["What The Article Covers", "What May Be Missing", "Evidence Findings",
+               "Remaining Uncertainty", "Overall Assessment"]
+    for h in headers:
+        formatted_conclusion = re.sub(
+            rf'^{re.escape(h)}\s*$',
+            f'<div style="font-weight:600; font-size:1rem; margin-top:16px; margin-bottom:8px; color:var(--text-primary);">{h}</div>',
+            formatted_conclusion,
+            flags=re.MULTILINE
+        )
     st.markdown(
         f"""
-        <div style="font-size: 1rem; line-height: 1.6; color: var(--text-primary); margin-bottom: 32px; white-space: pre-line; max-width: 1000px;">
-            {getattr(report, 'balanced_conclusion', '')}
+        <div class="dashboard-card" style="font-size: 0.95rem; line-height: 1.7;">
+            {formatted_conclusion}
         </div>
         """,
         unsafe_allow_html=True
@@ -819,8 +974,8 @@ Generated by BlindSpot AI.
     debug_mode_env = False
     try:
         debug_mode_env = getattr(Config.from_env(), "DEBUG_MODE", False)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"Developer tools failed ({__file__}:915): {e}")
         
     if dev_mode or debug_mode_env:
         st.markdown("---")

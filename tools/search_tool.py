@@ -36,8 +36,8 @@ class SearchTool:
             try:
                 with open(path, 'r', encoding='utf-8') as f:
                     return json.load(f)
-            except Exception:
-                pass
+            except Exception as e:
+                self.logger.warning(f"_load_cache failed ({search_tool.py:39}): {e}")
         return {}
 
     def _save_cache(self, cache: dict) -> None:
@@ -46,8 +46,8 @@ class SearchTool:
             path.parent.mkdir(parents=True, exist_ok=True)
             with open(path, 'w', encoding='utf-8') as f:
                 json.dump(cache, f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
+        except Exception as e:
+            self.logger.warning(f"_save_cache failed ({search_tool.py:49}): {e}")
 
     def _normalize_query(self, query: str) -> str:
         if not query:

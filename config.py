@@ -9,10 +9,10 @@ class Config:
     # Typed class attributes
     OLLAMA_BASE_URL: str
     OLLAMA_MODEL: str
-    MODEL_CLAIM_ANALYZER: str = "qwen3:1.7b"
-    MODEL_BLINDSPOT_DETECTOR: str = "qwen3:1.7b"
-    MODEL_EVIDENCE_EVALUATOR: str = "qwen3:1.7b"
-    MODEL_REPORT_GENERATOR: str = "qwen3:1.7b"
+    MODEL_CLAIM_ANALYZER: str = "qwen3:4b"
+    MODEL_BLINDSPOT_DETECTOR: str = "qwen3:4b"
+    MODEL_EVIDENCE_EVALUATOR: str = "qwen3:4b"
+    MODEL_REPORT_GENERATOR: str = "qwen3:4b"
     MAX_SEARCH_ATTEMPTS: int = 1
     CONFIDENCE_THRESHOLD: int = 70
     MAX_SEARCH_RESULTS: int = 15
@@ -25,11 +25,11 @@ class Config:
     def from_env(cls):
         # Reads from environment variables using os.getenv() with fallback defaults
         cls.OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-        cls.OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3:1.7b")
-        cls.MODEL_CLAIM_ANALYZER = os.getenv("MODEL_CLAIM_ANALYZER", "qwen3:1.7b")
-        cls.MODEL_BLINDSPOT_DETECTOR = os.getenv("MODEL_BLINDSPOT_DETECTOR", "qwen3:1.7b")
-        cls.MODEL_EVIDENCE_EVALUATOR = os.getenv("MODEL_EVIDENCE_EVALUATOR", "qwen3:1.7b")
-        cls.MODEL_REPORT_GENERATOR = os.getenv("MODEL_REPORT_GENERATOR", "qwen3:1.7b")
+        cls.OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3:4b")
+        cls.MODEL_CLAIM_ANALYZER = os.getenv("MODEL_CLAIM_ANALYZER", "qwen3:4b")
+        cls.MODEL_BLINDSPOT_DETECTOR = os.getenv("MODEL_BLINDSPOT_DETECTOR", "qwen3:4b")
+        cls.MODEL_EVIDENCE_EVALUATOR = os.getenv("MODEL_EVIDENCE_EVALUATOR", "qwen3:4b")
+        cls.MODEL_REPORT_GENERATOR = os.getenv("MODEL_REPORT_GENERATOR", "qwen3:4b")
         
         try:
             cls.MAX_SEARCH_ATTEMPTS = int(os.getenv("MAX_SEARCH_ATTEMPTS", "1"))

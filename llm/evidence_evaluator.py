@@ -2,6 +2,7 @@ from typing import List
 from urllib.parse import urlparse
 import re
 import json
+import traceback
 
 try:
     from rapidfuzz import fuzz
@@ -92,6 +93,8 @@ Your job is to evaluate search results and determine:
             search_results_str += (
                 f"Result {idx}:\n"
                 f"Title: {res.title}\n"
+                f"URL: {res.url}\n"
+                f"Source: {res.source}\n"
                 f"Snippet: {res.snippet}\n\n"
             )
 
@@ -165,16 +168,15 @@ Your job is to evaluate search results and determine:
             elif relevance == "Adds Context":
                 score += 10
                 
-            # If it covers a blindspot
-            addresses_blindspot = False
-            matched_bs_cat = ""
-            for bs in blindspots:
-                if self.check_semantic_coverage(bs.category, insight) or (res.snippet and self.check_semantic_coverage(bs.category, res.snippet)):
-                    addresses_blindspot = True
-                    matched_bs_cat = bs.category
-                    break
-            if not addresses_blindspot:
-                self.logger.info(f"Heuristic evidence discarded: cannot be linked to any blindspot for URL={res.url}")
+            # Relaxed triple match: topic AND (claim OR blindspot)
+            tm_valid, tm_reason, matched_claim_text, matched_bs_cat, match_score = self._triple_match(
+                evidence_insight=insight,
+                search_result=res,
+                claims=claims,
+                blindspots=blindspots
+            )
+            if not tm_valid:
+                self.logger.info(f"Heuristic evidence discarded ({tm_reason}): URL={res.url}")
                 continue
                 
             score += 20
@@ -186,8 +188,13 @@ Your job is to evaluate search results and determine:
                 quality=quality,
                 key_insight=insight,
                 relevance_score=score,
-                evidence_summary=f"External source confirms details and {relevance.lower()} the topic. It provides key insight: {insight}",
-                related_blindspot=matched_bs_cat
+                evidence_summary=f"External source {relevance.lower()} on the topic. Key insight: {insight}",
+                related_blindspot=matched_bs_cat,
+                match_score=match_score,
+                linked_claim=matched_claim_text,
+                linked_blindspot=matched_bs_cat,
+                matched_claim=matched_claim_text,
+                matched_blindspot=matched_bs_cat
             )
             self.logger.info(
                 f"Heuristic Evidence created: quality={ev.quality}, relevance={ev.relevance}, score={score}"
@@ -222,8 +229,8 @@ Your job is to evaluate search results and determine:
                     return parsed_records
             elif isinstance(parsed, dict):
                 return [parsed]
-        except Exception:
-            pass
+        except Exception as e:
+            self.logger.warning(f"JSON parse failed (evidence_evaluator.py:231): {traceback.format_exc()}")
             
         # Try finding markdown code block
         markdown_match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text)
@@ -239,8 +246,8 @@ Your job is to evaluate search results and determine:
                         return parsed_records
                 elif isinstance(parsed, dict):
                     return [parsed]
-            except Exception:
-                pass
+            except Exception as e:
+                self.logger.warning(f"JSON regex extract failed (evidence_evaluator.py:248): {traceback.format_exc()}")
         else:
             candidate_text = text
             
@@ -273,8 +280,8 @@ Your job is to evaluate search results and determine:
                 if isinstance(parsed_obj, dict):
                     parsed_records.append(parsed_obj)
                     continue
-            except Exception:
-                pass
+            except Exception as e:
+                self.logger.warning(f"JSON clean extract failed (evidence_evaluator.py:282): {traceback.format_exc()}")
                 
             # Attempt repairs on individual block
             try:
@@ -284,15 +291,16 @@ Your job is to evaluate search results and determine:
                 parsed_obj = json.loads(rep)
                 if isinstance(parsed_obj, dict):
                     parsed_records.append(parsed_obj)
-            except Exception:
+            except Exception as e:
+                self.logger.warning(f"Repair JSON parse failed (evidence_evaluator.py:294): {e}")
                 # Use repair_json_string from ollama_client if possible
                 try:
                     repaired = self.ollama_client.repair_json_string(cleaned_block)
                     parsed_obj = json.loads(repaired)
                     if isinstance(parsed_obj, dict):
                         parsed_records.append(parsed_obj)
-                except Exception:
-                    pass
+                except Exception as e:
+                    self.logger.warning(f"Nested JSON parse failed (evidence_evaluator.py:293): {traceback.format_exc()}")
                     
         return parsed_records
 
@@ -339,6 +347,92 @@ Your job is to evaluate search results and determine:
             
         return max(0, min(100, score))
 
+    def _triple_match(
+        self,
+        evidence_insight: str,
+        search_result: SearchResult,
+        claims: "ClaimAnalysis",
+        blindspots: "List[Blindspot]"
+    ) -> tuple:
+        """
+        Relaxed triple-match: evidence must match topic AND (claim OR blindspot).
+        At least two of three must pass (topic + at least one other).
+        Returns (is_valid, rejection_reason, linked_claim, linked_blindspot, match_score)
+        with individual scores logged.
+        """
+        import re
+
+        if not evidence_insight or not search_result:
+            return (False, "empty_evidence", "", "", 0.0)
+
+        insight_lower = evidence_insight.lower()
+        snippet_lower = (search_result.snippet or "").lower()
+        combined = insight_lower + " " + snippet_lower
+        combined_words = set(w for w in re.findall(r'\b\w+\b', combined) if len(w) > 3)
+
+        def overlap_ratio(words_a: set) -> float:
+            if not words_a or not combined_words:
+                return 0.0
+            overlap = words_a.intersection(combined_words)
+            denom = max(min(len(words_a), len(combined_words)), 1)
+            return len(overlap) / denom
+
+        linked_claim = ""
+        linked_blindspot = ""
+        topic_score = 0.0
+        claim_score = 0.0
+        blindspot_score = 0.0
+
+        # Topic match
+        topic = getattr(claims, "main_topic", "")
+        if topic:
+            topic_words = set(w for w in re.findall(r'\b\w+\b', topic.lower()) if len(w) > 3)
+            topic_score = overlap_ratio(topic_words)
+
+        # Claim match — pick best
+        best_claim_ratio = 0.0
+        if claims and claims.key_claims:
+            for claim in claims.key_claims:
+                claim_words = set(w for w in re.findall(r'\b\w+\b', claim.lower()) if len(w) > 3)
+                ratio = overlap_ratio(claim_words)
+                if ratio > best_claim_ratio:
+                    best_claim_ratio = ratio
+                    linked_claim = claim
+        claim_score = best_claim_ratio
+
+        # Blindspot match — pick best
+        best_bs_ratio = 0.0
+        if blindspots:
+            for bs in blindspots:
+                bs_lower = (bs.category + " " + bs.description).lower()
+                bs_words = set(w for w in re.findall(r'\b\w+\b', bs_lower) if len(w) > 3)
+                ratio = overlap_ratio(bs_words)
+                if ratio > best_bs_ratio:
+                    best_bs_ratio = ratio
+                    linked_blindspot = bs.category
+        blindspot_score = best_bs_ratio
+
+        # Relaxed: topic AND (claim OR blindspot)
+        topic_ok = topic_score >= 0.25
+        claim_ok = claim_score >= 0.25
+        blindspot_ok = blindspot_score >= 0.25
+
+        is_valid = topic_ok and (claim_ok or blindspot_ok)
+        total_score = (topic_score + max(claim_score, blindspot_score)) / 2.0
+
+        if not is_valid:
+            failed = []
+            if not topic_ok: failed.append(f"topic={topic_score:.2f}")
+            if not claim_ok and not blindspot_ok: failed.append(f"claim={claim_score:.2f} blindspot={blindspot_score:.2f}")
+            reason = "relaxed_match_failed: " + ", ".join(failed)
+            self.logger.info(
+                f"Evidence match REJECTED: {reason} | insight='{evidence_insight[:60]}...'"
+            )
+        else:
+            reason = ""
+
+        return (is_valid, reason, linked_claim, linked_blindspot, total_score)
+
     def _infer_source_quality(self, result: SearchResult) -> str:
         """
         Determine source quality using source credibility indicators.
@@ -356,7 +450,8 @@ Your job is to evaluate search results and determine:
             domain = urlparse(url).netloc.lower()
             if domain.startswith("www."):
                 domain = domain[4:]
-        except Exception:
+        except Exception as e:
+            self.logger.warning(f"Credibility assessment failed (evidence_evaluator.py:452): {e}")
             domain = ""
 
         for ind in high_indicators:
@@ -400,7 +495,8 @@ Your job is to evaluate search results and determine:
             netloc = parsed.netloc
             if netloc.startswith("www."):
                 netloc = netloc[4:]
-        except Exception:
+        except Exception as e:
+            self.logger.warning(f"Source type classification failed (evidence_evaluator.py:496): {e}")
             netloc = url_lower
 
         government_indicators = [".gov", "who.int", "un.org", "worldbank.org", "imf.org"]
@@ -596,25 +692,25 @@ Your job is to evaluate search results and determine:
         claims: ClaimAnalysis,
         blindspots: List[Blindspot],
         search_results: List[SearchResult]
-    ) -> List[Evidence]:
+    ):
         """
         Evaluates search results and extracts evidence objects using Ollama.
+        
+        Returns:
+            Tuple[List[Evidence], bool]: evidence items and whether fallback was used.
         """
         import time
-        import re
         
         if not search_results:
             self.logger.warning("No search results available for evaluation")
-            return []
+            return [], False
 
-        # Sort search results by source quality weight descending (Issue 6)
         search_results = sorted(search_results, key=lambda r: self._get_source_quality_weight(r.url), reverse=True)
 
-        # Deduplicate search results and filter thin content (< 5 words)
         unique_search_results = []
         seen_urls = set()
         seen_snippets = set()
-        for res in search_results:
+        for res in search_results[:8]:
             url_norm = res.url.lower().rstrip('/')
             snippet_norm = " ".join(res.snippet.lower().split())
             if not url_norm or url_norm in seen_urls:
@@ -632,7 +728,6 @@ Your job is to evaluate search results and determine:
         
         search_results = unique_search_results
 
-        # 1. Extract context keywords from title, topic, and key claims
         stop_words = {
             "new", "rule", "in", "without", "a", "valid", "may", "be", "denied", 
             "to", "for", "on", "of", "and", "or", "with", "the", "an", "at", "by", 
@@ -644,7 +739,6 @@ Your job is to evaluate search results and determine:
         context_clean = re.sub(r'[^a-zA-Z0-9\s]', ' ', combined_context)
         context_words = {w.lower() for w in context_clean.split() if w.strip().lower() not in stop_words and len(w) > 2}
 
-        # 2. Filter search results based on overlap
         relevant_results = []
         for res in search_results:
             res_text = f"{res.title} {res.snippet} {res.url}"
@@ -657,25 +751,24 @@ Your job is to evaluate search results and determine:
             else:
                 self.logger.info(f"Rejected irrelevant evidence: URL={res.url} Reason=no keyword overlap")
 
-        # Slice relevant search results to max 6 and truncate snippets to 120 max, titles to 80 max
         search_results_sliced = []
-        for res in relevant_results[:6]:
+        for res in relevant_results[:4]:
             res_copy = res.model_copy()
             if res_copy.snippet:
-                res_copy.snippet = res_copy.snippet[:120]
+                res_copy.snippet = res_copy.snippet[:500]
             if res_copy.title:
-                res_copy.title = res_copy.title[:80]
+                res_copy.title = res_copy.title[:150]
             search_results_sliced.append(res_copy)
 
         if not search_results_sliced:
             self.logger.warning("No relevant search results left after overlap filtering")
-            return []
+            return [], False
 
-        # 3. Check pre-call health check
         target_model = self.ollama_client.model
         if not self.ollama_client.pre_call_health_check(target_model):
             self.logger.warning("Ollama pre-call health check failed. Bypassing LLM and using heuristic evaluation.")
-            return self.heuristic_evaluate(article, claims, blindspots, search_results_sliced)
+            result = self.heuristic_evaluate(article, claims, blindspots, search_results_sliced)
+            return result, True
 
         self.logger.info(f"Evaluating {len(search_results_sliced)} search results")
         self.logger.info("Evidence evaluation started")
@@ -683,10 +776,10 @@ Your job is to evaluate search results and determine:
         system_prompt = self._build_system_prompt()
         user_prompt = self._build_evaluation_prompt(claims, blindspots, search_results_sliced)
 
-        # 4. Evaluation retries: up to 3 retries (4 attempts total)
+        # 4. Evaluation: 1 attempt, 20s timeout
         response_text = ""
         evaluations = []
-        max_attempts = 4
+        max_attempts = 1
         success = False
 
         for attempt in range(1, max_attempts + 1):
@@ -697,8 +790,8 @@ Your job is to evaluate search results and determine:
                     prompt=user_prompt,
                     system_prompt=system_prompt,
                     temperature=0.2,
-                    num_predict=512,
-                    timeout=60.0
+                    num_predict=256,
+                    timeout=10.0
                 )
                 elapsed = time.time() - start_time
                 self.logger.info(f"Ollama request attempt {attempt} finished in {int(elapsed)} seconds")
@@ -706,7 +799,6 @@ Your job is to evaluate search results and determine:
                 if response_text:
                     evaluations = self.safe_json_parse(response_text)
                     if evaluations:
-                        # Ensure at least one item has expected keys to verify it is a valid evidence structure
                         valid_items = [
                             item for item in evaluations
                             if isinstance(item, dict) and any(k in item for k in ["relevance", "quality", "key_insight"])
@@ -718,13 +810,11 @@ Your job is to evaluate search results and determine:
                             break
             except Exception as e:
                 self.logger.warning(f"Attempt {attempt} failed with error: {e}")
-                
-            if attempt < max_attempts:
-                time.sleep(2)
 
         if not success or not evaluations:
-            self.logger.warning("All LLM evidence evaluation attempts failed. Falling back to programmatic heuristic evaluate.")
-            return self.heuristic_evaluate(article, claims, blindspots, search_results_sliced)
+            self.logger.warning("LLM evidence evaluation timed out or failed. Switching to heuristic evaluation immediately.")
+            result = self.heuristic_evaluate(article, claims, blindspots, search_results_sliced)
+            return result, True
 
         self.logger.debug(f"Parsed {len(evaluations)} evaluation records")
 
@@ -802,9 +892,9 @@ Your job is to evaluate search results and determine:
                 
                 if any(kw in key_insight_lower for kw in contradict_keywords):
                     relevance_val = "Contradicts"
-                elif any(kw in key_insight_lower for key_insight_lower in support_keywords):
+                elif any(kw in key_insight_lower for kw in support_keywords):
                     relevance_val = "Supports"
-                elif any(kw in key_insight_lower for key_insight_lower in mixed_keywords):
+                elif any(kw in key_insight_lower for kw in mixed_keywords):
                     relevance_val = "Mixed"
                 else:
                     relevance_val = "Adds Context"
@@ -864,32 +954,27 @@ Your job is to evaluate search results and determine:
                 domain_val = urlparse(url_val).netloc
                 if domain_val.startswith("www."):
                     domain_val = domain_val[4:]
-            except Exception:
+            except Exception as e:
+                self.logger.warning(f"Domain extraction failed (evidence_evaluator.py:954): {e}")
                 domain_val = ""
                 
             evidence_summary = str(item.get("evidence_summary", "")).strip()
             if not evidence_summary:
-                evidence_summary = f"External source confirms details and {relevance.lower()} the topic. It provides key insight: {key_insight_str}"
+                evidence_summary = key_insight_str
                 
             if not url_val or not domain_val or not key_insight_str or not relevance or not evidence_summary:
                 self.logger.warning(f"Discarding evidence due to missing required fields: URL={url_val}")
                 continue
 
-            # relevance validation:
-            if not self._is_evidence_relevant(key_insight_str, search_results_sliced[index], claims, blindspots):
-                self.logger.info(f"Rejected evidence reason: no relation to topic for URL={search_results_sliced[index].url}")
-                continue
-
-            # Evidence-to-Blindspot Mapping constraint:
-            mapped_to_blindspot = False
-            matched_bs_cat = ""
-            for bs in blindspots:
-                if self.check_semantic_coverage(bs.category, key_insight_str) or self.check_semantic_coverage(bs.category, search_results_sliced[index].snippet):
-                    mapped_to_blindspot = True
-                    matched_bs_cat = bs.category
-                    break
-            if not mapped_to_blindspot:
-                self.logger.info(f"Discarding evidence (cannot be linked to any blindspot): URL={search_results_sliced[index].url}")
+            # Relaxed triple match: topic AND (claim OR blindspot)
+            tm_valid, tm_reason, matched_claim_text, matched_bs_cat, match_score = self._triple_match(
+                evidence_insight=key_insight_str,
+                search_result=search_results_sliced[index],
+                claims=claims,
+                blindspots=blindspots
+            )
+            if not tm_valid:
+                self.logger.info(f"Discarding evidence ({tm_reason}): URL={search_results_sliced[index].url}")
                 continue
 
             evidence_obj = Evidence(
@@ -899,7 +984,11 @@ Your job is to evaluate search results and determine:
                 key_insight=key_insight_str,
                 relevance_score=relevance_score,
                 evidence_summary=evidence_summary,
-                related_blindspot=matched_bs_cat
+                match_score=match_score,
+                linked_claim=matched_claim_text,
+                linked_blindspot=matched_bs_cat,
+                matched_claim=matched_claim_text,
+                matched_blindspot=matched_bs_cat
             )
             self.logger.info(
                 f"Evidence created: quality={evidence_obj.quality}, relevance={evidence_obj.relevance}, score={relevance_score}"
@@ -932,7 +1021,8 @@ Your job is to evaluate search results and determine:
                 domain = parsed.netloc.lower()
                 if domain.startswith("www."):
                     domain = domain[4:]
-            except Exception:
+            except Exception as e:
+                self.logger.warning(f"Domain parse failed (evidence_evaluator.py:1020): {e}")
                 domain = "unknown"
                 
             if domain_counts.get(domain, 0) < 2:
@@ -944,40 +1034,26 @@ Your job is to evaluate search results and determine:
         if not evidence_items:
             self.logger.warning("No evidence items generated. Bypassing and calling heuristic evaluation.")
             evidence_items = self.heuristic_evaluate(article, claims, blindspots, search_results_sliced)
+            self.logger.info(f"Selected {len(evidence_items)} evidence items from {len(search_results_sliced)} search results")
+            return evidence_items, True
 
         self.logger.info(f"Selected {len(evidence_items)} evidence items from {len(search_results_sliced)} search results")
-        return evidence_items
-
-    def _is_generic_category(self, category: str) -> bool:
-        if not category:
-            return True
-        generic_list = [
-            "opposing perspective", "historical context", "economic impact", "expert opinion",
-            "stakeholder view", "alternative perspective", "enforcement challenges", "historical outcomes",
-            "unintended consequences", "missing context", "transparency", "social impact",
-            "environmental impact", "governance", "policy alternatives", "other perspectives",
-            "unrepresented viewpoints", "regulatory challenges", "community engagement",
-            "social concerns", "public opinion", "stakeholder response"
-        ]
-        cat_lower = category.lower().strip()
-        for gen in generic_list:
-            if cat_lower == gen or gen in cat_lower:
-                return True
-        for suffix in ["implementation challenges", "stakeholder economic impact", "legal policy precedents", "primary implementation challenges"]:
-            if suffix in cat_lower:
-                return True
-        return False
+        return evidence_items, False
 
     def get_confidence_details(
         self,
         blindspots: List[Blindspot],
-        evidence: List[Evidence]
+        evidence: List[Evidence],
+        llm_failures: int = 0,
+        llm_calls: int = 0
     ) -> dict:
         """
-        Calculates confidence score and detailed coverage analytics.
+        Continuous confidence scoring: no caps, floors, buckets, or artificial penalties.
+        Score emerges from data via weighted continuous formula.
+        Final confidence is multiplied by system reliability factor.
         """
         from tools.search_tool import SearchTool
-        
+
         if not evidence:
             return {
                 "score": 0,
@@ -992,188 +1068,103 @@ Your job is to evaluate search results and determine:
                 "academic_sources": 0,
                 "government_sources": 0,
                 "news_sources": 0,
-                "score_breakdown": {}
+                "score_breakdown": {},
+                "reliability_factor": 0.0
             }
 
-        # 1. Quality points with saturation penalty
-        domain_counts = {}
-        quality_score = 0.0
-        high_q_count = 0
-        medium_q_count = 0
-        low_q_count = 0
-        for ev in evidence:
-            domain = ev.search_result.source.lower().strip()
-            domain_counts[domain] = domain_counts.get(domain, 0) + 1
-            idx = domain_counts[domain]
-            
-            # Domain saturation penalty
-            if idx == 1:
-                weight = 1.0
-            elif idx == 2:
-                weight = 0.5
-            elif idx == 3:
-                weight = 0.25
-            else:
-                weight = 0.0
-                
-            q = ev.quality
-            if q == "High":
-                base_q = 20
-                high_q_count += 1
-            elif q == "Medium":
-                base_q = 12
-                medium_q_count += 1
-            else:
-                base_q = 5
-                low_q_count += 1
-                
-            quality_score += base_q * weight
-            
-        quality_score = min(50.0, quality_score)
+        n = len(evidence)
 
-        # 2. Blindspot coverage points
+        # 1. Evidence Quality (weight 0.30)
+        quality_values = {"High": 1.0, "Medium": 0.6, "Low": 0.2}
+        raw_quality = sum(quality_values.get(ev.quality, 0.3) for ev in evidence)
+        quality_component = (raw_quality / max(n, 1)) * 30.0
+
+        # 2. Blindspot Coverage (weight 0.25)
         total_blindspots = len(blindspots)
         covered_blindspots = 0
         for bs in blindspots:
-            covered = False
             for ev in evidence:
                 if self.check_semantic_coverage(bs.category, ev.key_insight):
-                    covered = True
+                    covered_blindspots += 1
                     break
-            if covered:
-                covered_blindspots += 1
-                
-        coverage_ratio = covered_blindspots / total_blindspots if total_blindspots > 0 else 0.0
-        coverage_points = covered_blindspots * 15.0
-        coverage_points = min(45.0, coverage_points)
+        coverage_ratio = covered_blindspots / max(total_blindspots, 1)
+        coverage_component = coverage_ratio * 25.0
 
-        # 3. Source diversity points
+        # 3. Claim Linkage (weight 0.20)
+        match_scores = [getattr(ev, "match_score", 0.0) for ev in evidence]
+        avg_match = sum(match_scores) / max(n, 1)
+        linkage_component = avg_match * 20.0
+
+        # 4. Source Diversity (weight 0.15)
+        domain_counts = {}
+        for ev in evidence:
+            d = ev.search_result.source.lower().strip()
+            domain_counts[d] = domain_counts.get(d, 0) + 1
+        unique_domains_count = len(domain_counts)
+        diversity_component = 15.0 * min(unique_domains_count / max(n, 1), 1.0)
+
+        # 5. Source Reliability (weight 0.10)
+        reliability_map = {
+            "academic": 1.0, "government": 1.0, "think_tank": 0.8,
+            "news": 0.6, "industry": 0.4, "blog": 0.2, "social_media": 0.1, "other": 0.3
+        }
+        total_reliability = 0.0
         academic_sources = 0
         government_sources = 0
         news_sources = 0
         for ev in evidence:
             url = getattr(ev.search_result, "url", "")
-            source_type = SearchTool.classify_source_type(url)
-            if source_type == "academic":
-                academic_sources += 1
-            elif source_type == "government":
-                government_sources += 1
-            elif source_type == "news":
-                news_sources += 1
-                
-        unique_domains_count = len(domain_counts)
-        diversity_points = unique_domains_count * 5.0
-        diversity_points = min(20.0, diversity_points)
+            st = SearchTool.classify_source_type(url)
+            total_reliability += reliability_map.get(st, 0.3)
+            if st == "academic": academic_sources += 1
+            elif st == "government": government_sources += 1
+            elif st == "news": news_sources += 1
+        source_reliability_component = (total_reliability / max(n, 1)) * 10.0
 
-        # 4. Contradiction Analysis
+        # Continuous score from evidence data only — no caps, no floors, no artificial penalties
+        raw_score = (
+            quality_component +
+            coverage_component +
+            linkage_component +
+            diversity_component +
+            source_reliability_component
+        )
+
+        # System reliability factor: successful_llm_calls / total_llm_calls
+        total_calls = max(llm_calls, 1)  # avoid division by zero
+        successful_calls = total_calls - llm_failures
+        reliability_factor = max(0.0, successful_calls / total_calls)
+
+        # Final score = data-based score * reliability factor
+        score_val = raw_score * reliability_factor
+
         contradict_count = sum(1 for ev in evidence if getattr(ev, "relevance", "").lower() == "contradicts")
-        contradiction_bonus = 10.0 if contradict_count > 0 else 0.0
-
-        # 5. Agreement Bonus (if multiple high quality sources are present)
-        agreement_bonus = 10.0 if high_q_count >= 2 else 0.0
-
-        # Base confidence score
-        raw_score = quality_score + coverage_points + diversity_points + contradiction_bonus + agreement_bonus
-        score_val = int(raw_score)
-
-        # Apply Penalties:
-        # 1. Generic blindspots penalty (-15)
-        has_generic = any(self._is_generic_category(bs.category) for bs in blindspots)
-        if has_generic:
-            score_val -= 15
-            self.logger.info("Penalty applied: generic blindspots (-15)")
-            
-        # 2. Low source diversity (-10)
-        if unique_domains_count <= 1 and len(evidence) >= 2:
-            score_val -= 10
-            self.logger.info("Penalty applied: low source diversity (-10)")
-            
-        # 3. Weak coverage (< 50% coverage, -15)
-        if coverage_ratio < 0.5:
-            score_val -= 15
-            self.logger.info("Penalty applied: weak coverage (< 50% coverage, -15)")
-            
-        # 4. Weak relevance penalty (-15)
-        avg_relevance_score = sum(ev.relevance_score for ev in evidence) / len(evidence) if evidence else 0
-        if len(evidence) > 0 and avg_relevance_score < 55:
-            score_val -= 15
-            self.logger.info("Penalty applied: weak relevance (-15)")
-
-        # Apply strict realistic caps (Revised Caps from User request):
-        if len(evidence) == 1:
-            score_val = min(score_val, 40)
-            self.logger.info(f"Confidence cap applied: 1 evidence -> cap 40")
-        elif len(evidence) == 2:
-            score_val = min(score_val, 60)
-            self.logger.info(f"Confidence cap applied: 2 evidence -> cap 60")
-        elif len(evidence) == 3:
-            score_val = min(score_val, 80)
-            self.logger.info(f"Confidence cap applied: 3 evidence -> cap 80")
-        elif len(evidence) >= 4:
-            score_val = min(score_val, 95)
-            self.logger.info(f"Confidence cap applied: 4+ evidence -> cap 95")
-
-        if coverage_ratio < 1.0:
-            if score_val > 80:
-                self.logger.info(f"Confidence cap applied: coverage < 1.0 -> cap 80")
-                score_val = min(score_val, 80)
-                
-        if high_q_count == 0:
-            if score_val > 65:
-                self.logger.info(f"Confidence cap applied: high_quality == 0 -> cap 65")
-                score_val = min(score_val, 65)
-
-        # B. Repetitive sources cap (unique domains <= 1 and count >= 2)
-        if unique_domains_count <= 1 and len(evidence) >= 2:
-            score_val = min(score_val, 40)
-            
-        # D. Zero coverage cap
-        has_strong_qd = False
-        if covered_blindspots == 0:
-            has_strong_qd = (unique_domains_count >= 2 and (high_q_count >= 1 or (high_q_count + medium_q_count) >= 2))
-            cap_limit = 35 if has_strong_qd else 20
-            score_val = min(score_val, cap_limit)
-
-        # Floors:
-        if len(evidence) >= 1:
-            score_val = max(15, score_val)
-
-        score_val = max(0, min(100, score_val))
+        high_q_count = sum(1 for ev in evidence if ev.quality == "High")
+        medium_q_count = sum(1 for ev in evidence if ev.quality == "Medium")
+        low_q_count = sum(1 for ev in evidence if ev.quality == "Low")
 
         score_breakdown = {
-            "quality_points": int(quality_score),
-            "coverage_points": int(coverage_points),
-            "diversity_points": int(diversity_points),
-            "contradiction_bonus": int(contradiction_bonus),
-            "agreement_bonus": int(agreement_bonus),
+            "quality_component": round(quality_component, 2),
+            "coverage_component": round(coverage_component, 2),
+            "linkage_component": round(linkage_component, 2),
+            "diversity_component": round(diversity_component, 2),
+            "source_reliability_component": round(source_reliability_component, 2),
+            "reliability_factor": round(reliability_factor, 2),
             "coverage_ratio": coverage_ratio,
             "unique_domains": unique_domains_count
         }
 
         self.logger.info(
-            f"Confidence analytics: score={score_val}, coverage_ratio={coverage_ratio:.2f}, "
-            f"evidence_count={len(evidence)}, high_q={high_q_count}, "
-            f"contradicts={contradict_count}, unique_domains={unique_domains_count}"
-        )
-        self.logger.info(
-            f"Confidence breakdown details:\n"
-            f"  - Quality Points: {quality_score}\n"
-            f"  - Coverage Points: {coverage_points}\n"
-            f"  - Diversity Points: {diversity_points}\n"
-            f"  - Contradiction Bonus: {contradiction_bonus}\n"
-            f"  - Agreement Bonus: {agreement_bonus}\n"
-            f"  - Caps applied: 1 evidence limit (30)? {len(evidence) == 1}, "
-            f"2 evidence limit (50)? {len(evidence) == 2}, repetitive sources limit (40)? {unique_domains_count <= 1 and len(evidence) >= 2}, "
-            f"incomplete coverage limit (60)? {coverage_ratio < 0.5}, zero coverage cap (20/35)? {covered_blindspots == 0} (strong Q&D? {has_strong_qd})"
+            f"Confidence analytics: score={score_val:.1f}, coverage_ratio={coverage_ratio:.2f}, "
+            f"evidence_count={n}, reliability={reliability_factor:.2f}, "
+            f"high_q={high_q_count}, unique_domains={unique_domains_count}"
         )
 
         return {
-            "score": score_val,
+            "score": int(round(score_val)),
             "coverage_ratio": coverage_ratio,
-            "actual_coverage_ratio": coverage_ratio,
-            "fallback_coverage_ratio": coverage_ratio,
             "blindspot_count": total_blindspots,
-            "evidence_count": len(evidence),
+            "evidence_count": n,
             "high_quality_count": high_q_count,
             "medium_quality_count": medium_q_count,
             "low_quality_count": low_q_count,
@@ -1182,18 +1173,21 @@ Your job is to evaluate search results and determine:
             "academic_sources": academic_sources,
             "government_sources": government_sources,
             "news_sources": news_sources,
+            "reliability_factor": reliability_factor,
             "score_breakdown": score_breakdown
         }
 
     def calculate_confidence(
         self,
         blindspots: List[Blindspot],
-        evidence: List[Evidence]
+        evidence: List[Evidence],
+        llm_failures: int = 0,
+        llm_calls: int = 0
     ) -> int:
         """
-        Estimate confidence that enough external evidence has been collected.
+        Estimate confidence based purely on evidence data weighted by system reliability.
         """
-        details = self.get_confidence_details(blindspots, evidence)
+        details = self.get_confidence_details(blindspots, evidence, llm_failures=llm_failures, llm_calls=llm_calls)
         score = details["score"]
         self.logger.info(f"Confidence score: {score}%")
         self.logger.debug(f"Confidence details: {details}")
@@ -1298,7 +1292,7 @@ if __name__ == "__main__":
         print("\n==================================================")
         print("EVALUATING SEARCH RESULTS")
         print("==================================================")
-        evidence_list = evaluator.evaluate(article, claims, blindspots, search_results)
+        evidence_list, _ = evaluator.evaluate(article, claims, blindspots, search_results)
 
         for idx, ev in enumerate(evidence_list, 1):
             print(f"\nEvidence {idx}:")

@@ -4,6 +4,7 @@ import re
 from models.data_models import (
     AgentState,
     PlannerDecision,
+    QueryIntent,
     Blindspot,
     Evidence,
     ArticleData,
@@ -281,11 +282,13 @@ No explanations outside the JSON.
         queries = self._generate_intent_queries_for_blindspot(topic, blindspot)
         return queries[0] if queries else f"{topic} {blindspot.category} criticism"
 
-    def _generate_initial_queries(self, state: AgentState) -> List[str]:
+    def _generate_initial_queries(self, state: AgentState) -> List[QueryIntent]:
         """
-        Generate highly specific, article-grounded queries based on title keywords,
-        main topic, claims, and blindspots using the intent-based queries.
+        Generate query_intent objects — each with query_text, target_entity, target_claim, target_blindspot.
+        Uses article entities for entity grounding.
         """
+        from models.data_models import QueryIntent
+
         topic = state.claims.main_topic if (state.claims and state.claims.main_topic) else ""
         if not topic or topic == "Unknown":
             topic = state.article.title if state.article else "Policy"
@@ -295,57 +298,106 @@ No explanations outside the JSON.
         topic_clean = re.sub(r'[^\w\s\-]', ' ', topic).strip()
         topic_phrase = " ".join(topic_clean.split())
 
-        all_candidates = []
+        # Pull entities from state
+        entities = getattr(state, "article_entities", {})
+        all_entity_values = []
+        for cat_list in entities.values():
+            for e in cat_list:
+                if isinstance(e, str) and e.strip():
+                    all_entity_values.append(e.strip())
+
+        # Pull claims
+        claims_list = []
+        if state.claims and state.claims.key_claims:
+            claims_list = state.claims.key_claims
+
         blindspots = state.blindspots or []
-        
-        # Prioritize uncovered blindspots
         coverage = self._estimate_blindspot_coverage(state)
         uncovered_bs = [bs for bs in blindspots if not coverage.get(bs.category, False)]
         covered_bs = [bs for bs in blindspots if coverage.get(bs.category, False)]
-        
-        # Interleave queries: uncovered first, then covered
-        for idx in range(3):
-            for bs in uncovered_bs:
-                intent_queries = self._generate_intent_queries_for_blindspot(topic, bs)
-                if idx < len(intent_queries):
-                    q = intent_queries[idx]
-                    if q not in all_candidates:
-                        all_candidates.append(q)
-            for bs in covered_bs:
-                intent_queries = self._generate_intent_queries_for_blindspot(topic, bs)
-                if idx < len(intent_queries):
-                    q = intent_queries[idx]
-                    if q not in all_candidates:
-                        all_candidates.append(q)
 
-        # Fallback if no blindspots exist
-        if not blindspots:
-            all_candidates.append(f"{topic_phrase} policy implementation details and analysis")
-            all_candidates.append(f"{topic_phrase} academic research studies and statistics")
+        all_intents: List[QueryIntent] = []
+        seen_texts = set()
 
+        def add_intent(qt: str, entity: str, claim: str, bs: str):
+            text = " ".join(qt.split())
+            if text and text.lower() not in seen_texts:
+                seen_texts.add(text.lower())
+                all_intents.append(QueryIntent(
+                    query_text=text,
+                    target_entity=entity,
+                    target_claim=claim,
+                    target_blindspot=bs
+                ))
+
+        # Build queries per blindspot × entity × claim
+        for bs in uncovered_bs + covered_bs:
+            cat = bs.category
+            cat_clean = re.sub(r'[^\w\s\-]', ' ', cat).strip()
+
+            # If entities exist, build entity-targeted queries
+            if all_entity_values:
+                for ent in all_entity_values[:3]:
+                    for claim in claims_list[:2]:
+                        add_intent(
+                            f"{ent} {cat_clean} {claim}",
+                            entity=ent, claim=claim, bs=cat
+                        )
+                    add_intent(
+                        f"{ent} {cat_clean} analysis",
+                        entity=ent, claim="", bs=cat
+                    )
+
+            # Claim + blindspot queries (no specific entity)
+            for claim in claims_list[:3]:
+                add_intent(
+                    f"{topic_phrase} {cat_clean} {claim}",
+                    entity="", claim=claim, bs=cat
+                )
+
+            # Intent-aspect queries
+            for aspect in ["criticism", "impact", "expert perspective"]:
+                add_intent(
+                    f"{topic_phrase} {cat_clean} {aspect}",
+                    entity="", claim="", bs=cat
+                )
+
+        # Fallback if no intents
+        if not all_intents:
+            fallback_text = f"{topic_phrase} policy implementation details and analysis"
+            add_intent(fallback_text, entity="", claim="", bs="")
+
+        # Validate query_texts (extract strings, validate, rewrap)
         article_keywords = []
         if state.article and state.article.title:
             article_keywords = [w.lower() for w in re.findall(r'\b\w+\b', state.article.title)]
-            
-        valid_queries = self._validate_queries(all_candidates, article_keywords, state)
-        
-        # De-duplicate while keeping order
-        unique_queries = []
-        for q in valid_queries:
-            if q not in unique_queries:
-                unique_queries.append(q)
 
-        # Return only unique unused queries
+        raw_texts = [qi.query_text for qi in all_intents]
+        valid_texts = self._validate_queries(raw_texts, article_keywords, state)
+        valid_set = set(v.lower() for v in valid_texts)
+        valid_intents = [qi for qi in all_intents if qi.query_text.lower() in valid_set]
+
+        # De-duplicate by query_text
+        seen_final = set()
+        deduped = []
+        for qi in valid_intents:
+            key = qi.query_text.lower()
+            if key not in seen_final:
+                seen_final.add(key)
+                deduped.append(qi)
+
+        # Exclude already-used queries
         used_set = set(str(q).lower().strip() for q in getattr(state, "search_queries_used", []))
-        unused = [q for q in unique_queries if q.lower().strip() not in used_set]
-        
-        return unused[:3] if unused else unique_queries[:3]
+        unused = [qi for qi in deduped if qi.query_text.lower().strip() not in used_set]
+
+        return unused[:3] if unused else deduped[:3]
 
     def _generate_fallback_queries(self, state: AgentState) -> List[str]:
         """
-        Generates alternative search queries.
+        Generates alternative search queries as raw strings.
         """
-        return self._generate_initial_queries(state)
+        intents = self._generate_initial_queries(state)
+        return [qi.query_text for qi in intents]
 
     def _validate_queries(self, queries: List[str], article_keywords: List[str], state: Optional[AgentState] = None) -> List[str]:
         valid_queries = []
@@ -494,23 +546,27 @@ No explanations outside the JSON.
             # Rule 4: evidence_count == 0 -> SEARCH
             if len(evidence_list) == 0:
                 self.logger.info("Rule 4: No evidence gathered yet, starting initial searches")
-                initial_queries = self._generate_initial_queries(state)
-                valid_queries = self._validate_queries(initial_queries, article_keywords, state)
+                initial_intents = self._generate_initial_queries(state)
+                query_texts = [qi.query_text for qi in initial_intents]
+                valid_queries = self._validate_queries(query_texts, article_keywords, state)
                 if not valid_queries:
-                    valid_queries = initial_queries[:3]
+                    valid_queries = query_texts[:3]
                 return PlannerDecision(
                     action="SEARCH",
                     queries=valid_queries,
+                    query_intents=initial_intents,
                     reasoning="Starting initial evidence gathering"
                 )
 
             # If none of the rule-based shortcuts trigger, call the LLM planner.
             if not self.ollama_client.pre_call_health_check(self.config.OLLAMA_MODEL):
                 self.logger.warning("Ollama pre-call health check failed. Skipping LLM planner decision and using fallback queries.")
-                fallback_queries = self._generate_initial_queries(state)
+                fallback_intents = self._generate_initial_queries(state)
+                fb_texts = [qi.query_text for qi in fallback_intents]
                 return PlannerDecision(
                     action="SEARCH_MORE",
-                    queries=fallback_queries[:3],
+                    queries=fb_texts[:3],
+                    query_intents=fallback_intents[:3],
                     reasoning="Bypassed LLM planner due to health check failure"
                 )
 
@@ -522,7 +578,9 @@ No explanations outside the JSON.
                 prompt=planning_prompt,
                 system_prompt=system_prompt,
                 temperature=0.2,
-                num_predict=128
+                num_predict=128,
+                max_retries=0,
+                timeout=10.0
             )
 
             decision_action = response.get("action", "SEARCH_MORE")
@@ -535,22 +593,28 @@ No explanations outside the JSON.
             if not isinstance(queries, list):
                 queries = []
 
-            # Programmatically replace/supplement LLM queries with high-value queries
+            # Use LLM queries as primary; supplement with programmatic only when LLM returns empty
             if decision_action != "GENERATE_REPORT":
-                valid_queries = self._generate_initial_queries(state)
+                if queries:
+                    valid_queries = queries[:3]
+                    # Wrap LLM query strings in QueryIntent (no entity/claim/blindstop provenance available)
+                    valid_intents = [
+                        QueryIntent(query_text=q, target_entity="", target_claim="", target_blindspot="")
+                        for q in valid_queries
+                    ]
+                else:
+                    self.logger.info("LLM returned empty queries; falling back to programmatic generation.")
+                    fallback_intents = self._generate_initial_queries(state)
+                    valid_queries = [qi.query_text for qi in fallback_intents][:3]
+                    valid_intents = fallback_intents[:3]
             else:
                 valid_queries = []
-
-            if decision_action != "GENERATE_REPORT" and not valid_queries:
-                self.logger.info("Planner returned empty or invalid search queries; generating automatic alternative fallback queries.")
-                valid_queries = self._generate_initial_queries(state)
-
-            # Enforce strict maximum of 3 queries per loop
-            valid_queries = valid_queries[:3]
+                valid_intents = []
 
             decision = PlannerDecision(
                 action=decision_action,
                 queries=valid_queries,
+                query_intents=valid_intents,
                 reasoning=reasoning
             )
             self.logger.info(f"LLM Planner decision: {decision_action} — {reasoning} with queries: {valid_queries}")
@@ -558,10 +622,12 @@ No explanations outside the JSON.
 
         except Exception as error:
             self.logger.error(f"Planner failed: {error}")
-            fallback_queries = self._generate_initial_queries(state)
+            fallback_intents = self._generate_initial_queries(state)
+            fb_texts = [qi.query_text for qi in fallback_intents]
             return PlannerDecision(
                 action="SEARCH_MORE",
-                queries=fallback_queries[:3],
+                queries=fb_texts[:3],
+                query_intents=fallback_intents[:3],
                 reasoning="Fallback due to planner error"
             )
 

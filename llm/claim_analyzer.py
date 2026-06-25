@@ -4,6 +4,8 @@ from models.data_models import ArticleData, ClaimAnalysis
 from llm.ollama_client import OllamaClient, ExtractionPreset
 from utils.logger import get_logger
 from config import Config
+import os
+from utils.stage_timer import StageTimer
 
 class ClaimAnalyzer:
     """
@@ -283,7 +285,80 @@ class ClaimAnalyzer:
             f"Content: {truncated_content}"
         )
 
-    def analyze(self, article: ArticleData) -> ClaimAnalysis:
+    def _score_claim_quality(self, claim: str, article: ArticleData, entities: dict = None) -> int:
+        """
+        Score a claim 0-100 based on specificity, evidence in article, and entity grounding.
+        """
+        import re
+        score = 50  # base
+        words = claim.split()
+        word_count = len(words)
+
+        # Specificity: longer claims with specific details score higher
+        if word_count >= 20:
+            score += 15
+        elif word_count >= 15:
+            score += 10
+        elif word_count >= 12:
+            score += 5
+
+        # Presence of numbers/dates (specificity signal)
+        has_numbers = bool(re.search(r'\d+', claim))
+        if has_numbers:
+            score += 10
+
+        # Entity grounding: Uppercase named entities in the claim
+        entities_found = set(re.findall(r'\b[A-Z][a-zA-Z]{2,}\b', claim))
+        if len(entities_found) >= 2:
+            score += 10
+        elif len(entities_found) >= 1:
+            score += 5
+
+        # Check if claim contains a verb (action words)
+        has_verb = bool(re.search(r'\b(is|was|were|are|has|had|have|will|said|says|reported|shows|found|plan|plans|planned|propose|proposes|proposed|announce|announces|announced|introduce|introduces|introduced|implement|implements|implemented|require|requires|required|create|creates|created|affect|affects|affected|reduce|reduces|reduced)\b', claim, re.IGNORECASE))
+        if has_verb:
+            score += 10
+
+        # Evidence in article: fuzzy match against article content
+        if article and article.content:
+            from rapidfuzz import fuzz
+            match_ratio = fuzz.partial_ratio(claim.lower(), article.content.lower())
+            if match_ratio >= 95:
+                score += 10
+            elif match_ratio >= 85:
+                score += 5
+
+        # Title fragment penalty
+        if article and article.title:
+            title_lower = article.title.lower()
+            claim_lower = claim.lower().strip()
+            # Check if claim is mostly the title
+            title_words = set(re.findall(r'\b\w+\b', title_lower))
+            claim_words_set = set(re.findall(r'\b\w+\b', claim_lower))
+            if title_words and claim_words_set:
+                overlap = len(title_words.intersection(claim_words_set))
+                if overlap >= len(claim_words_set) * 0.7 and len(claim_words_set) <= 10:
+                    score = max(score - 30, 0)
+
+        return max(0, min(100, score))
+
+    def _filter_claims_by_quality(self, claims: list, article: ArticleData, entities: dict = None) -> tuple:
+        """
+        Filter claims by quality score, return (filtered_claims, scores).
+        Rejects claims with score < 50.
+        """
+        result_claims = []
+        result_scores = []
+        for claim in claims:
+            score = self._score_claim_quality(claim, article, entities)
+            if score >= 50:
+                result_claims.append(claim)
+                result_scores.append(score)
+            else:
+                self.logger.info(f"Discarding low-quality claim (score={score}): '{claim[:60]}...'")
+        return result_claims, result_scores
+
+    def analyze(self, article: ArticleData):
         """
         Analyzes the claims of an article using the Ollama LLM client.
         
@@ -291,69 +366,35 @@ class ClaimAnalyzer:
             article (ArticleData): The article metadata and content.
             
         Returns:
-            ClaimAnalysis: The structured claims, tone, and framing of the article.
+            Tuple[ClaimAnalysis, bool]: The structured claims and whether fallback was used.
         """
         fallback_claims = self._get_deterministic_fallback(article)
         try:
-            # A. Log analysis start
+            elapsed = 0.0
+            tokens = len(article.content.split()) if article and article.content else 0
+
             self.logger.info(f"Analyzing claims for: {article.title}")
 
-            # B. Verify Ollama availability and model via pre-call check
             if not self.ollama_client.pre_call_health_check(self.config.MODEL_CLAIM_ANALYZER):
                 self.logger.warning("Ollama pre-call health check failed. Skipping LLM claim analysis and using deterministic fallback.")
-                return fallback_claims
+                return fallback_claims, True
 
-            # C. Build prompts
-            system_prompt: str = self._build_system_prompt()
-            analysis_prompt: str = self._build_analysis_prompt(article)
-
-            # D. Call model and record execution time with a 60-second timeout
-            start_time = time.time()
-            response: dict = self.ollama_client.generate_json_with_retry(
-                prompt=analysis_prompt,
-                system_prompt=system_prompt,
-                max_retries=1,
-                temperature=0.2,
-                num_predict=384,
-                preset_name=ExtractionPreset.CLAIM_ANALYZER_NAME,
-                model=self.config.MODEL_CLAIM_ANALYZER,
-                timeout=60.0
-            )
-            elapsed = time.time() - start_time
-            self.logger.info(f"LLM claim extraction completed in {elapsed:.2f} seconds")
-
-            # E. Log raw response at DEBUG level
-            self.logger.debug(f"Raw claim analysis response: {response}")
-
-            # F. Convert response into ClaimAnalysis with safe defaults & validation
-            if not isinstance(response, dict) or not response:
-                self.logger.warning("Empty or invalid claim analyzer response. Returning deterministic fallback.")
-                return fallback_claims
-
-            main_topic = response.get("main_topic")
-            key_claims = response.get("key_claims")
-            author_stance = response.get("author_stance")
-            tone = response.get("tone")
             framing_summary = response.get("framing_summary")
 
-            # Robust nested/escaped fallback checks for string fields if they returned empty/missing
             def get_fallback_field(field_name: str, current_val: str) -> str:
                 if isinstance(current_val, str) and current_val.strip() not in ("", "Unknown"):
                     return current_val
-                # Scan all dictionary key-value strings for the field name
                 import re
                 for k, v in response.items():
                     key_str = str(k)
                     val_str = str(v)
                     if field_name in key_str or field_name in val_str:
                         combined = f"{key_str} : {val_str}"
-                        # Match everything after field name and colon, up to the end of string or closing quotes
                         match = re.search(fr'{field_name}["\\]*\s*[:=]\s*["\\]*([\s\S]+?)(?:["\\]+\s*)?$', combined)
                         if match:
                             candidate = match.group(1).strip().rstrip('}').strip().strip('"').strip("'")
                             if candidate:
                                 return candidate
-                        # Simple split fallback
                         if ":" in combined:
                             parts = combined.split(":", 1)
                             candidate = parts[1].strip().strip('"').strip("'").strip().rstrip('}').strip()
@@ -375,11 +416,9 @@ class ClaimAnalyzer:
             tone = get_fallback_field("tone", tone)
             framing_summary = get_fallback_field("framing_summary", framing_summary)
 
-        # Scale claim limits: 3 to 6 claims
             max_claims = 6
             min_claims = 3
 
-            # Validate field types and assign fallbacks if invalid/missing/empty
             if not isinstance(key_claims, list):
                 key_claims = []
             else:
@@ -390,79 +429,87 @@ class ClaimAnalyzer:
                     claim_str = str(claim).strip()
                     if not claim_str:
                         continue
-                    
-                    # Discard if shorter than 8 words
                     claim_words = claim_str.split()
                     if len(claim_words) < 8:
                         self.logger.info(f"Discarding claim (length < 8 words): '{claim_str}'")
                         continue
-                        
-                    # Reject if noun phrase only
                     if self._is_noun_phrase_only(claim_str):
                         self.logger.info(f"Discarding claim (noun phrase only): '{claim_str}'")
                         continue
-
-                    # If between 8 and 11 words, pad to at least 12 words
-#   (Removed disallowed metadata phrase addition)
-#   Original logic has been omitted to prevent adding "as detailed in the published report."
-#   Claims will remain as extracted without artificial padding.
                     claim_words = claim_str.split()
-                        
-                    # Truncate if exceeding 40 words
                     if len(claim_words) > 40:
                         self.logger.info(f"Truncating claim (length > 40 words): '{claim_str}'")
                         claim_str = " ".join(claim_words[:40])
                         if not claim_str.endswith('.'):
                             claim_str += '.'
-                            
                     cleaned_claims.append(claim_str)
                 key_claims = cleaned_claims
 
-            # Filter duplicates and empty strings
             unique_claims = []
+            source_sentences = []
+            from rapidfuzz import fuzz
             for claim in key_claims:
-                if claim and claim not in unique_claims:
-                    unique_claims.append(claim)
+                if not claim:
+                    continue
+                claim_str = str(claim).strip()
+                match_ratio = fuzz.partial_ratio(claim_str.lower(), article.content.lower()) if article.content else 0
+                if match_ratio < 55:
+                    self.logger.info(f"Discarding claim (fuzzy match {match_ratio}% < 80): '{claim_str}'")
+                    continue
+                if claim_str not in unique_claims:
+                    unique_claims.append(claim_str)
+                    idx = article.content.lower().find(claim_str.lower())
+                    if idx != -1:
+                        start = article.content.rfind('. ', 0, idx) + 2
+                        end = article.content.find('. ', idx)
+                        if end == -1:
+                            end = len(article.content)
+                        sentence = article.content[start:end+1].strip()
+                        source_sentences.append(sentence)
+                    else:
+                        source_sentences.append("")
 
-            # Programmatically slice or supplement if necessary
             if len(unique_claims) > max_claims:
                 self.logger.info(f"Slicing claims from {len(unique_claims)} to {max_claims}")
                 unique_claims = unique_claims[:max_claims]
+                source_sentences = source_sentences[:max_claims]
             elif len(unique_claims) < min_claims:
                 self.logger.info(f"Supplementing claims from fallback. Current: {len(unique_claims)}, target min: {min_claims}")
                 fallback_list = fallback_claims.key_claims
                 for f_claim in fallback_list:
                     if f_claim not in unique_claims:
                         unique_claims.append(f_claim)
+                        source_sentences.append("")
                         if len(unique_claims) >= min_claims:
                             break
-                # Ensure it meets min_claims
                 if len(unique_claims) < min_claims:
                     unique_claims = fallback_list[:min_claims]
+                    source_sentences = [""] * len(unique_claims)
 
             key_claims = unique_claims
 
-            # G. Validation
-            if main_topic.strip() == "":
+            key_claims, claim_quality_scores = self._filter_claims_by_quality(key_claims, article)
+
+            if not main_topic.strip():
                 main_topic = "Unknown"
 
             if not key_claims:
                 self.logger.warning("No claims extracted from article. Returning deterministic fallback.")
-                return fallback_claims
+                return fallback_claims, True
 
-            # Log number of claims extracted at DEBUG level
             self.logger.debug(f"Extracted {len(key_claims)} claims")
 
             claims = ClaimAnalysis(
-    main_topic=main_topic,
-    key_claims=key_claims,
-    author_stance=author_stance,
-    tone=tone,
-    framing_summary=framing_summary,
-    claim_confidences=[]
-)
+                main_topic=main_topic,
+                key_claims=key_claims,
+                author_stance=author_stance,
+                tone=tone,
+                framing_summary=framing_summary,
+                claim_confidences=[],
+                claim_quality_scores=claim_quality_scores,
+                source_sentences=source_sentences
+            )
 
-            # H. Log completion
             self.logger.info(f"Claim analysis complete. Topic: {claims.main_topic}")
 
             self.logger.info(
@@ -471,13 +518,11 @@ class ClaimAnalyzer:
                 f"Tokens: {tokens}"
             )
 
-            # I. Return ClaimAnalysis object
-            return claims
+            return claims, False
 
         except Exception as error:
-            # J. Exception Handling
             self.logger.error(f"Claim analysis failed: {error}. Returning deterministic fallback.")
-            return fallback_claims
+            return fallback_claims, True
 
 if __name__ == "__main__":
     try:
@@ -519,7 +564,7 @@ if __name__ == "__main__":
 
         # Call analyze and measure execution time
         start_time = time.time()
-        claims = analyzer.analyze(article)
+        claims, _ = analyzer.analyze(article)
         execution_time = time.time() - start_time
 
         # Print formatted results

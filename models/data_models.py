@@ -12,7 +12,10 @@ class ArticleData(BaseModel):
     publication_date: str = "Unknown"
     content: str
     word_count: int = 0
+    paragraph_count: int = 0
     access_restricted: bool = False
+    is_metadata_only: bool = False
+    article_quality: str = "High"
 
     @model_validator(mode="after")
     def set_word_count(self) -> ArticleData:
@@ -21,14 +24,15 @@ class ArticleData(BaseModel):
 
 class ClaimAnalysis(BaseModel):
     """
-    Analyzes the main claims, stance, and tone of the article.
+    Extracted claims, stance, tone, and framing from an article.
     """
     main_topic: str
-    key_claims: List[str]
-    author_stance: str
-    tone: str
-    framing_summary: str
+    key_claims: List[str] = Field(default_factory=list)
+    author_stance: str = ""
+    tone: str = ""
+    framing_summary: str = ""
     claim_confidences: List[int] = Field(default_factory=list)
+    claim_quality_scores: List[int] = Field(default_factory=list)
     source_sentences: List[str] = Field(default_factory=list)
 
 class Blindspot(BaseModel):
@@ -55,8 +59,6 @@ class SearchResult(BaseModel):
     source: str = "DuckDuckGo"
 
 class Evidence(BaseModel):
-    linked_claim: Optional[str] = None
-    linked_blindspot: Optional[str] = None
     """
     Pairs a search result with evaluations on how it relates to original claims.
     """
@@ -65,6 +67,12 @@ class Evidence(BaseModel):
     quality: str
     key_insight: str
     relevance_score: int = 0
+    evidence_summary: str = ""
+    match_score: float = 0.0
+    linked_claim: Optional[str] = None
+    linked_blindspot: Optional[str] = None
+    matched_claim: str = ""
+    matched_blindspot: str = ""
 
 class AgentState(BaseModel):
     """
@@ -77,6 +85,7 @@ class AgentState(BaseModel):
     search_attempts: int = 0
     confidence_score: int = 0
     search_queries_used: List[str] = Field(default_factory=list)
+    query_intents: List[QueryIntent] = Field(default_factory=list)
     status: str = "initialized"
     
     # Tracking fields declared directly (avoiding extra="allow")
@@ -97,6 +106,24 @@ class AgentState(BaseModel):
     confidence_history: List[int] = Field(default_factory=list)
     unique_domains: List[str] = Field(default_factory=list)
     llm_failures: int = 0
+    article_entities: dict = Field(default_factory=lambda: {
+        "people": [], "organizations": [], "locations": [],
+        "policies": [], "programs": [], "exams": [],
+        "political_parties": [], "institutions": []
+    })
+    understanding_score: int = 0
+    used_fallback_claims: bool = False
+    used_fallback_blindspots: bool = False
+    used_fallback_evidence: bool = False
+
+class QueryIntent(BaseModel):
+    """
+    A search query with provenance tracking: which entity, claim, and blindspot it targets.
+    """
+    query_text: str
+    target_entity: str = ""
+    target_claim: str = ""
+    target_blindspot: str = ""
 
 class PlannerDecision(BaseModel):
     """
@@ -104,6 +131,7 @@ class PlannerDecision(BaseModel):
     """
     action: str
     queries: List[str] = Field(default_factory=list)
+    query_intents: List[QueryIntent] = Field(default_factory=list)
     claim_confidences: List[int] = Field(default_factory=list)
     reasoning: str
 

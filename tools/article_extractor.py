@@ -8,6 +8,7 @@ from bs4 import BeautifulSoup
 
 from models.data_models import ArticleData
 from utils.logger import get_logger
+from utils.article_validator import ArticlePageValidator
 from config import Config
 
 
@@ -255,7 +256,8 @@ class ArticleExtractor:
             if netloc.startswith("www."):
                 netloc = netloc[4:]
             return netloc
-        except Exception:
+        except Exception as e:
+            self.logger.warning(f"Source extraction failed ({article_extractor.py}:259): {e}")
             return "Unknown"
 
     # Original deterministic_title_from_url moved; see later definition.
@@ -265,24 +267,14 @@ class ArticleExtractor:
     def is_valid_news_article(self, title: str, content: str, raw_html: str) -> bool:
         """Validate that the extracted page is a genuine news article.
 
-        Rules:
-        * Title must not be empty, generic placeholder, or indicate a homepage.
-        * If the article body has >= 500 words, accept automatically.
-        * Otherwise, require either word count >= 200 OR at least 4 paragraphs,
-          and the ratio of article body length to raw HTML length >= 0.5.
+        Accepts any article with meaningful content. Strict filtering
+        (tag/category/archive pages) is handled by ArticlePageValidator.
         """
         if not title or title.lower().startswith("homepage") or title == "Unknown Title":
-            return False
-        word_count = len(content.split())
-        # Automatic acceptance for long articles
-        if word_count >= 500:
-            return True
-        paragraph_count = len([p for p in content.split("\n\n") if p.strip()])
-        # Compute body ratio (avoid division by zero)
-        body_ratio = len(content) / len(raw_html) if raw_html else 0
-        if (word_count >= 200 or paragraph_count >= 4) and body_ratio >= 0.5:
-            return True
-        return False
+            word_count = len(content.split())
+            if word_count < 50:
+                return False
+        return True
 
     def deterministic_title_from_url(self, url: str) -> str:
         """Generate a deterministic title from a URL when extraction fails."""
@@ -299,7 +291,8 @@ class ArticleExtractor:
             if len(title) > 5:
                 return title
             return "Article on " + parsed.netloc
-        except Exception:
+        except Exception as e:
+            self.logger.warning(f"Title extraction from URL failed ({article_extractor.py}:303): {e}")
             return "Article from web link"
 
     def _generate_fallback_article(self, url: str, title: str = None) -> ArticleData:
@@ -320,7 +313,11 @@ class ArticleExtractor:
             title=title,
             author="Unknown",
             publication_date="Unknown",
-            content=content
+            content=content,
+            access_restricted=True,
+            is_metadata_only=True,
+            paragraph_count=0,
+            article_quality="Low"
         )
 
     def extract(self, url: str) -> ArticleData:
@@ -338,6 +335,10 @@ class ArticleExtractor:
             art.access_restricted = True
             return art
 
+        title = "Unknown Article"
+        author = "Unknown"
+        publication_date = "Unknown"
+        content = ""
         status_code = 200
         response_text = ""
         try:
@@ -369,11 +370,12 @@ class ArticleExtractor:
                 access_restricted = True
 
         if access_restricted:
-            self.logger.warning(f"Access restriction detected on {url}. Setting access_restricted=True.")
-            art = self._generate_fallback_article(url)
-            art.access_restricted = True
-            art.content = "Article content could not be accessed. Reason: Publisher restriction. Analysis limited to metadata."
-            return art
+            self.logger.warning(f"Access restriction detected on {url}.")
+            return ArticleData(
+                url=url, title=title or "Unknown", author=author or "Unknown",
+                publication_date=publication_date or "Unknown",
+                content="", access_restricted=True, is_metadata_only=True
+            )
 
         soup = BeautifulSoup(response_text, "lxml") if response_text else BeautifulSoup("", "lxml")
         title = self._extract_title(soup)
@@ -421,43 +423,72 @@ class ArticleExtractor:
             except Exception as e:
                 self.logger.warning(f"Layer 3 (Trafilatura) failed: {e}")
 
-        # Layer 4: Metadata-only fallback
-        if word_count < 150:
-            self.logger.warning(f"All extraction layers yielded < 150 words (current word count: {word_count}). Using Layer 4 (Metadata fallback).")
+        # Layer 4: Metadata-only fallback (only if < 150 words AND < 3 paragraphs)
+        paragraph_count = len([p for p in content.split("\n\n") if p.strip()]) if content else 0
+        if word_count < 150 and paragraph_count < 3:
+            self.logger.warning(f"All extraction layers yielded < 150 words and < 3 paragraphs (words: {word_count}, paragraphs: {paragraph_count}). Metadata-only fallback.")
             meta_desc = self._extract_metadata_content(soup)
             if meta_desc and len(meta_desc.split()) >= 10:
-                self.logger.info("Using metadata description fallback.")
-                content = (
-                    f"Metadata Description: {meta_desc}\n\n"
-                    f"Additional fallback text: The article is titled '{title}' and published on "
-                    f"{self._extract_source(url)}."
-                )
+                content = meta_desc
             else:
-                if title and title != "Unknown Title":
-                    self.logger.info("Using title-based fallback.")
-                    content = (
-                        f"This is a fallback description for the article '{title}'. "
-                        f"Due to access limits, full paragraphs could not be parsed."
-                    )
-                else:
-                    self.logger.info("No metadata available. Constructing complete fallback article.")
-                    return self._generate_fallback_article(url)
+                content = title or "Unknown"
+            article = ArticleData(
+                url=url, title=title or "Unknown", author=author or "Unknown",
+                publication_date=publication_date or "Unknown",
+                content=content, access_restricted=True, is_metadata_only=True,
+                paragraph_count=0, article_quality="Low"
+            )
+            return article
 
-        # Check for category page bypass
-                # Reject obvious category pages
+        # Reject obvious category pages
         if (
             title.lower().strip() in self.category_titles
             and word_count < 300
         ):
-            self.logger.warning("URL appears to be a category page, not a news article. Using fallback content.")
-            return self._generate_fallback_article(url, title)
+            self.logger.warning("URL appears to be a category page, not a news article.")
+            ppc = len([p for p in content.split("\n\n") if p.strip()]) if content else 0
+            return ArticleData(
+                url=url, title=title, author=author or "Unknown",
+                publication_date=publication_date or "Unknown",
+                content=content or "", access_restricted=True, is_metadata_only=True,
+                paragraph_count=ppc, article_quality="Low"
+            )
+
+        # Phase 1 validation: reject tag/category/archive pages
+        validator = ArticlePageValidator()
+        vresult = validator.validate(url, response_text, title, content)
+        if not vresult["valid"]:
+            self.logger.warning(f"Article page validation failed: {vresult['reason']}.")
+            ppc = len([p for p in content.split("\n\n") if p.strip()]) if content else 0
+            return ArticleData(
+                url=url, title=title, author=author or "Unknown",
+                publication_date=publication_date or "Unknown",
+                content=content or "", access_restricted=True, is_metadata_only=True,
+                paragraph_count=ppc, article_quality="Low"
+            )
 
         # Final validation based on refined rules
         if not self.is_valid_news_article(title, content, response_text):
-            self.logger.warning("Article failed validation checks. Falling back to metadata-only article.")
-            return self._generate_fallback_article(url, title)
+            self.logger.warning("Article failed validation checks.")
+            pwc = len(content.split()) if content else 0
+            ppc = len([p for p in content.split("\n\n") if p.strip()]) if content else 0
+            return ArticleData(
+                url=url, title=title, author=author or "Unknown",
+                publication_date=publication_date or "Unknown",
+                content=content or "", access_restricted=True, is_metadata_only=True,
+                paragraph_count=ppc, article_quality="Low"
+            )
 
         # If we reach here the article is considered valid
+        paragraph_count = len([p for p in content.split("\n\n") if p.strip()]) if content else 0
+
+        # Classify article quality
+        if word_count >= 250:
+            article_quality = "High"
+        elif word_count >= 150:
+            article_quality = "Medium"
+        else:
+            article_quality = "Low"
 
         article = ArticleData(
             url=url,
@@ -465,13 +496,27 @@ class ArticleExtractor:
             author=author,
             publication_date=publication_date,
             content=content,
-            access_restricted=False
+            access_restricted=False,
+            paragraph_count=paragraph_count,
+            article_quality=article_quality
         )
 
         self.logger.info(
             f"Successfully extracted article: "
             f"'{title}' "
-            f"(word count: {article.word_count})"
+            f"(word count: {article.word_count}, "
+            f"paragraphs: {paragraph_count}, "
+            f"quality: {article_quality})"
+        )
+
+        # Diagnostic validation log
+        self.logger.info(
+            f"ARTICLE VALIDATION: "
+            f"word_count={article.word_count}, "
+            f"paragraph_count={paragraph_count}, "
+            f"metadata_only={article.is_metadata_only}, "
+            f"validation_reason=passed, "
+            f"article_quality={article_quality}"
         )
 
         return article

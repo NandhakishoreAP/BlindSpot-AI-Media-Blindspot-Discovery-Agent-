@@ -123,39 +123,6 @@ class BlindspotDetector:
                 
         return False
 
-    def _is_generic_category(self, category: str) -> bool:
-        """
-        Returns True if the category is generic (e.g. Opposing Perspective, Historical Context, etc.)
-        """
-        if not category:
-            return True
-        generic_list = [
-            "opposing perspective",
-            "historical context",
-            "economic impact",
-            "expert opinion",
-            "stakeholder view",
-            "alternative perspective",
-            "enforcement challenges",
-            "historical outcomes",
-            "unintended consequences",
-            "missing context",
-            "transparency",
-            "social impact",
-            "environmental impact",
-            "governance",
-            "policy alternatives",
-            "other perspectives",
-            "unrepresented viewpoints",
-            "regulatory challenges",
-            "community engagement"
-        ]
-        cat_lower = category.lower().strip()
-        for gen in generic_list:
-            if cat_lower == gen or gen in cat_lower:
-                return True
-        return False
-
     def is_generic_blindspot(self, category: str, article: ArticleData = None, title: str = None, topic: str = None) -> bool:
         if not category:
             return True
@@ -386,6 +353,87 @@ class BlindspotDetector:
         topic = claims.main_topic if claims else ""
         return self.build_article_specific_blindspots(title, claims, topic)
 
+    def _blindspot_coverage_score(self, blindspot: Blindspot, article: ArticleData) -> float:
+        """
+        Returns 0.0-1.0 indicating how much the article already discusses the blindspot topic.
+        High score means the article already covers it → blindspot should be rejected.
+        """
+        if not article or not article.content:
+            return 0.0
+        import re
+        bs_text = (blindspot.category + " " + blindspot.description).lower()
+        bs_words = set(w for w in re.findall(r'\b\w+\b', bs_text) if len(w) > 3)
+        if not bs_words:
+            return 0.0
+        content_lower = article.content.lower()
+        content_words = set(w for w in re.findall(r'\b\w+\b', content_lower))
+
+        overlap = bs_words.intersection(content_words)
+        if not overlap:
+            return 0.0
+
+        ratio = len(overlap) / len(bs_words)
+        # Also count how many times these words appear in article (frequency signal)
+        freq_sum = sum(content_lower.count(w) for w in overlap)
+        avg_freq = freq_sum / max(len(overlap), 1)
+
+        # Continuous score: higher ratio + higher frequency = more likely discussed
+        freq_bonus = min(0.15, avg_freq * 0.03)
+        return min(1.0, ratio + freq_bonus)
+
+    def validate_blindspot(
+        self,
+        blindspot: Blindspot,
+        article_entities: dict,
+        claims: ClaimAnalysis,
+        article: ArticleData = None
+    ) -> tuple:
+        """
+        Validates a blindspot against article entities and claims.
+        Also checks if the article already discusses the blindspot.
+        Returns (is_valid, rejection_reason, linked_entities, linked_claims).
+        """
+        import re
+
+        all_article_entities = set()
+        for cat in ["people", "organizations", "locations", "policies", "programs", "exams", "political_parties", "institutions"]:
+            for e in article_entities.get(cat, []):
+                all_article_entities.add(e.lower())
+
+        bs_text = (blindspot.category + " " + blindspot.description).lower()
+
+        # 1. Entity overlap check
+        linked_entities = []
+        for entity in all_article_entities:
+            if entity in bs_text:
+                linked_entities.append(entity)
+
+        # 2. Claim overlap check
+        linked_claims = []
+        if claims and claims.key_claims:
+            for claim in claims.key_claims:
+                claim_lower = claim.lower()
+                bs_words = set(w for w in re.findall(r'\b\w+\b', bs_text) if len(w) > 3)
+                claim_words = set(w for w in re.findall(r'\b\w+\b', claim_lower) if len(w) > 3)
+                if bs_words and claim_words:
+                    overlap = bs_words.intersection(claim_words)
+                    if len(overlap) >= 2:
+                        linked_claims.append(claim)
+
+        # Reject only if BOTH entity and claim overlap fail
+        if not linked_entities and not linked_claims:
+            return (False, "entity_overlap=0 AND claim_overlap=0", [], [])
+
+        # 3. Already-discussed check: reject if blindspot is already covered by article
+        if article:
+            cov_score = self._blindspot_coverage_score(blindspot, article)
+            if cov_score >= 0.5:
+                return (False, f"already_discussed (overlap={cov_score:.2f})", linked_entities, linked_claims)
+            if cov_score >= 0.35:
+                self.logger.info(f"Blindspot '{blindspot.category}' partially overlaps article (coverage={cov_score:.2f})")
+
+        return (True, "", linked_entities, linked_claims)
+
     def _limit_words(self, text: str, max_words: int) -> str:
         if not text:
             return ""
@@ -398,39 +446,37 @@ class BlindspotDetector:
         self,
         article: ArticleData,
         claims: ClaimAnalysis
-    ) -> List[Blindspot]:
+    ):
         """
         Detects blindspots inside the article using Ollama.
+        
+        Returns:
+            Tuple[List[Blindspot], bool]: blindspots and whether fallback was used.
         """
         fallback_blindspots = self._get_deterministic_blindspots(article, claims)
         try:
-            # 1. Log: "Detecting blindspots for: {article.title}"
             self.logger.info(f"Detecting blindspots for: {article.title}")
 
-            # 2. Verify Ollama availability and model via pre-call check
             if not self.ollama_client.pre_call_health_check(self.config.MODEL_BLINDSPOT_DETECTOR):
                 self.logger.warning("Ollama pre-call health check failed. Skipping LLM blindspot detection and using deterministic fallback.")
                 self.link_claims_to_blindspots(fallback_blindspots, claims)
-                return fallback_blindspots
+                return fallback_blindspots, True
 
-            # 3. Build prompts:
             system_prompt = self._build_system_prompt()
             analysis_prompt = self._build_detection_prompt(article, claims)
 
-            # 4. Call generate_json_with_retry
             response = self.ollama_client.generate_json_with_retry(
                 prompt=analysis_prompt,
                 system_prompt=system_prompt,
                 temperature=0.2,
                 num_predict=256,
+                max_retries=0,
                 model=self.config.MODEL_BLINDSPOT_DETECTOR,
-                timeout=60.0
+                timeout=10.0
             )
 
-            # 5. Log raw response:
             self.logger.debug(f"Raw blindspot response: {response}")
 
-            # Helper to parse response into Blindspot list
             def parse_response_to_blindspots(resp: dict) -> List[Blindspot]:
                 if not isinstance(resp, dict) or not resp:
                     return []
@@ -497,8 +543,9 @@ class BlindspotDetector:
                     system_prompt=system_prompt,
                     temperature=0.4,
                     num_predict=256,
+                    max_retries=0,
                     model=self.config.MODEL_BLINDSPOT_DETECTOR,
-                    timeout=60.0
+                    timeout=10.0
                 )
                 self.logger.debug(f"Regenerated blindspot response: {response}")
                 blindspots = parse_response_to_blindspots(response)
@@ -526,15 +573,13 @@ class BlindspotDetector:
             blindspots = blindspots[:5]
             self.link_claims_to_blindspots(blindspots, claims)
 
-            # 10. Log:
             self.logger.info(f"Detected {len(blindspots)} blindspots")
-            return blindspots
+            return blindspots, False
 
         except Exception as error:
-            # 12. Error Handling
             self.logger.error(f"Blindspot detection failed: {error}. Returning fallback.")
             self.link_claims_to_blindspots(fallback_blindspots, claims)
-            return fallback_blindspots
+            return fallback_blindspots, True
 
 if __name__ == "__main__":
     try:
@@ -602,7 +647,7 @@ if __name__ == "__main__":
         print("RUNNING BLINDSPOT DETECTION")
         print("==================================================")
         
-        blindspots = detector.detect(article, claims)
+        blindspots, _ = detector.detect(article, claims)
 
         print("\n==================================================")
         print("BLINDSPOT DETECTION RESULTS")
