@@ -8,13 +8,14 @@ from models.data_models import (
     ArticleData,
     Blindspot,
     Evidence,
-    ClaimAnalysis
+    ClaimAnalysis,
+    PlannerDecision
 )
 
 
 from tools.article_extractor import ArticleExtractor
 from tools.search_tool import SearchTool
-from llm.ollama_client import OllamaClient
+from llm.client_factory import create_llm_client
 from llm.claim_analyzer import ClaimAnalyzer
 from llm.blindspot_detector import BlindspotDetector
 from llm.evidence_evaluator import EvidenceEvaluator
@@ -45,21 +46,18 @@ class MediaBlindspotAgent:
         self.config: Config = config
         self.logger = get_logger("orchestrator")
         
-        # Instantiate Ollama Client first (triggers model warmup with fallback)
-        self.ollama_client = OllamaClient(config)
+        # Instantiate LLM client first (triggers model warmup with fallback)
+        self.ollama_client = create_llm_client(config)
         self.ollama_available = self.ollama_client.available
         
         if self.ollama_available:
-            self.logger.info(f"Ollama available | Active model: {self.ollama_client.model}")
+            backend_name = type(self.ollama_client).__name__.replace("Client", "")
+            self.logger.info(f"Backend: {backend_name} | Active model: {self.ollama_client.model}")
         else:
-            self.logger.error("No model available after fallback attempts. OllamaClient unavailable.")
+            self.logger.error("No model available after fallback attempts. LLM client unavailable.")
             self.ollama_failure_reason = (
                 "Could not initialize any language model. "
-                "Ollama may not be running, or no compatible model is installed. "
-                "Please ensure Ollama is running and at least one of the following "
-                "models is installed: " + ", ".join(
-                    [config.OLLAMA_MODEL] + ["qwen3:4b", "qwen3:1.7b", "phi4-mini"]
-                )
+                "Please check your LLM_BACKEND and API configuration."
             )
             # Remaining components won't be instantiated; analyze() will abort immediately.
 
@@ -184,14 +182,33 @@ class MediaBlindspotAgent:
                     break
 
                 # Query planner
-                # If circuit breaker is triggered (llm_failures >= 3), bypass planner LLM
+                # If circuit breaker is triggered (llm_failures >= 3), bypass planner LLM and generate queries from blindspots
                 llm_failures = self.ollama_client.failures_count
                 if llm_failures >= 3:
-                    self.logger.warning("Circuit breaker triggered: skipping planner LLM call and requesting programmatic report.")
-                    state.completion_reason = "max_attempts_reached"
-                    break
-                    
-                decision = self.planner.decide(state)
+                    self.logger.warning("Circuit breaker triggered: generating fallback queries from blindspots.")
+                    fallback_queries = []
+                    for bs in state.blindspots:
+                        sq = getattr(bs, "suggested_search_query", "").strip()
+                        if sq:
+                            fallback_queries.append(sq)
+                    if not fallback_queries:
+                        topic = getattr(state.claims, "main_topic", "") if state.claims else ""
+                        for bs in state.blindspots[:3]:
+                            cat = getattr(bs, "category", "")
+                            q = f"{topic} {cat}".strip()
+                            if len(q.split()) >= 3:
+                                fallback_queries.append(q)
+                    if fallback_queries:
+                        decision = PlannerDecision(
+                            action="SEARCH_MORE",
+                            queries=fallback_queries[:3],
+                            reasoning="Fallback queries from circuit breaker"
+                        )
+                    else:
+                        state.completion_reason = "no_queries"
+                        break
+                else:
+                    decision = self.planner.decide(state)
                 
                 # Record LLM failures count in state
                 state.llm_failures = self.ollama_client.failures_count
@@ -971,7 +988,7 @@ if __name__ == "__main__":
         config = Config.from_env()
         agent = MediaBlindspotAgent(config)
         print("Agent initialized successfully")
-        print(f"Ollama available: {agent.ollama_available}")
+        print(f"Backend available: {agent.ollama_available}")
     except ImportError:
         print("ReportGenerator not yet implemented — will be added in Step 12")
     except Exception as e:

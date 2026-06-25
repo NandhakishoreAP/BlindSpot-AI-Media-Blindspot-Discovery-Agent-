@@ -5,8 +5,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Any
 
+from typing import Any
 from models.data_models import AgentState, BlindspotReport, Blindspot, Evidence
-from llm.ollama_client import OllamaClient
 from utils.logger import get_logger
 from config import Config
 
@@ -18,7 +18,7 @@ class ReportGenerator:
     source quality analytics, and LLM-driven explanation.
     """
 
-    def __init__(self, ollama_client: OllamaClient, config: Config) -> None:
+    def __init__(self, ollama_client: Any, config: Config) -> None:
         """
         Initializes the ReportGenerator.
         """
@@ -581,7 +581,7 @@ class ReportGenerator:
             use_programmatic = (
                 confidence == 0 or
                 llm_failures > 0 or
-                not self.ollama_client.pre_call_health_check(self.ollama_client.model)
+                not self.ollama_client.pre_call_health_check()
             )
 
             if use_programmatic:
@@ -836,8 +836,9 @@ if __name__ == "__main__":
 
     try:
         from models.data_models import ArticleData, ClaimAnalysis, Blindspot, SearchResult, Evidence
+        from llm.client_factory import create_llm_client
         config = Config.from_env()
-        client = OllamaClient(config)
+        client = create_llm_client(config)
         rg = ReportGenerator(client, config)
 
         # 1. Create ArticleData

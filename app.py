@@ -310,19 +310,6 @@ if reports_dir.exists():
 # Sidebar setup
 with st.sidebar:
     st.markdown("## BlindSpot AI")
-    st.markdown("---")
-    
-    # System Status Section (read-only)
-    try:
-        config = Config.from_env()
-        model = config.OLLAMA_MODEL
-        status = "Active" if config.OLLAMA_BASE_URL else "Inactive"
-        dev_mode = debug_mode_env = getattr(config, "DEBUG_MODE", False) or os.environ.get("DEBUG_MODE", "").lower() in ("1", "true")
-    except Exception as e:
-        logger.warning(f"System status check failed ({__file__}:336): {e}")
-        dev_mode = False
-        
-    st.markdown("---")
     
     # Recent Reports Section
     st.markdown("### Recent Reports")
@@ -391,7 +378,6 @@ with st.sidebar:
                     if st.button("Delete", key=f"del_{idx}_{rf.name}", use_container_width=True):
                         st.session_state.delete_confirm = rf
                         st.rerun()
-            st.markdown("")
         st.markdown('</div>', unsafe_allow_html=True)
     
     # System Status (clean table, below recent reports)
@@ -401,20 +387,34 @@ with st.sidebar:
         
         # Get active model info from agent if available
         agent_obj = st.session_state.get("agent")
+        quota_exceeded = False
         if agent_obj and hasattr(agent_obj, "ollama_client") and agent_obj.ollama_client:
-            active_model = agent_obj.ollama_client.model
+            client = agent_obj.ollama_client
+            active_model = client.model
             if hasattr(agent_obj, "ollama_available"):
                 model_available = agent_obj.ollama_available
             else:
                 model_available = False
+            quota_exceeded = getattr(client, "quota_exceeded", False)
         else:
-            active_model = config_sys.OLLAMA_MODEL
+            if config_sys.LLM_BACKEND == "gemini":
+                active_model = config_sys.GEMINI_MODEL
+            else:
+                active_model = config_sys.OLLAMA_MODEL
             model_available = False
+
+        if model_available:
+            if quota_exceeded:
+                model_status = "Quota Exceeded"
+                model_status_color = "var(--warning)"
+            else:
+                model_status = "Available"
+                model_status_color = "var(--success)"
+        else:
+            model_status = "Unavailable"
+            model_status_color = "var(--danger)"
         
-        model_status = "Available" if model_available else "Unavailable"
-        model_status_color = "var(--success)" if model_available else "var(--danger)"
-        
-        search_status = "Active" if config_sys.OLLAMA_BASE_URL else "Inactive"
+        search_status = "Active"
         runtime_budget = f"{getattr(config_sys, 'MAX_RESEARCH_SECONDS', 90)} sec"
         
         # Last analysis result
@@ -466,11 +466,28 @@ with st.sidebar:
             """,
             unsafe_allow_html=True
         )
+        # Show quota warning if Gemini rate limit was hit
+        if quota_exceeded:
+            retry_after = getattr(agent_obj.ollama_client, "quota_retry_after", 0) if agent_obj and hasattr(agent_obj, "ollama_client") else 0
+            remaining = max(0, int(retry_after - time.time()))
+            st.markdown(
+                f"""
+                <div style="margin-top:16px; padding:12px; border-radius:8px; border:1px solid rgba(201,123,0,0.3); background-color:rgba(201,123,0,0.08); font-size:0.85rem; line-height:1.5;">
+                    <div style="font-weight:600; color:var(--warning); margin-bottom:4px;">Gemini Quota Exceeded</div>
+                    <div style="color:var(--text-secondary); font-size:0.8rem;">
+                        The Gemini API rate limit was reached. Analysis will continue using fallback methods with reduced quality.
+                    </div>
+                    <div style="color:var(--text-secondary); font-size:0.8rem; margin-top:4px;">
+                        Retry in approximately <strong>{remaining}s</strong> or switch to a different model.
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+
     except Exception as e:
         logger.warning(f"System status check failed ({__file__}:336): {e}")
         st.warning("Status unavailable")
-    
-    st.markdown("---")
     
     # About Section (Collapsed by default)
     with st.expander("About", expanded=False):
@@ -624,12 +641,12 @@ def display_error(error_dict):
     elif "timeout" in msg:
         friendly_title = "Analysis Timeout"
         friendly_msg = "The request timed out because the model took longer than the timeout threshold. Try again or check local service resources."
-    elif "modelnotfound" in msg or "model not found" in msg or "not installed" in msg:
+    elif "modelnotfound" in msg or "model not found" in msg or "not installed" in msg or "permission_denied" in msg or "403" in msg:
         friendly_title = "Model Unavailable"
-        friendly_msg = "The requested LLM model is not installed or available on the local Ollama server."
+        friendly_msg = "The requested LLM model is not available. Check your API key and model configuration."
     elif "connection" in msg or "unreachable" in msg or "refused" in msg or "ollama" in msg:
         friendly_title = "Network Failure"
-        friendly_msg = "Could not connect to the local Ollama service. Please verify that Ollama is running and available."
+        friendly_msg = "Could not connect to the LLM backend. Please verify that the service is running and available."
     else:
         friendly_title = "Article Inaccessible"
         friendly_msg = "The system encountered an error loading or parsing this article URL. Please verify the URL and try again."
@@ -977,7 +994,7 @@ Generated by BlindSpot AI.
     except Exception as e:
         logger.warning(f"Developer tools failed ({__file__}:915): {e}")
         
-    if dev_mode or debug_mode_env:
+    if debug_mode_env:
         st.markdown("---")
         with st.expander("Developer Tools", expanded=False):
             st.json(json_data)

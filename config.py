@@ -7,8 +7,11 @@ load_dotenv()
 
 class Config:
     # Typed class attributes
+    LLM_BACKEND: str = "ollama"
     OLLAMA_BASE_URL: str
     OLLAMA_MODEL: str
+    GEMINI_API_KEY: str = ""
+    GEMINI_MODEL: str = "gemini-2.5-flash"
     MODEL_CLAIM_ANALYZER: str = "qwen3:4b"
     MODEL_BLINDSPOT_DETECTOR: str = "qwen3:4b"
     MODEL_EVIDENCE_EVALUATOR: str = "qwen3:4b"
@@ -24,8 +27,11 @@ class Config:
     @classmethod
     def from_env(cls):
         # Reads from environment variables using os.getenv() with fallback defaults
+        cls.LLM_BACKEND = os.getenv("LLM_BACKEND", "ollama")
         cls.OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
         cls.OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3:4b")
+        cls.GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+        cls.GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
         cls.MODEL_CLAIM_ANALYZER = os.getenv("MODEL_CLAIM_ANALYZER", "qwen3:4b")
         cls.MODEL_BLINDSPOT_DETECTOR = os.getenv("MODEL_BLINDSPOT_DETECTOR", "qwen3:4b")
         cls.MODEL_EVIDENCE_EVALUATOR = os.getenv("MODEL_EVIDENCE_EVALUATOR", "qwen3:4b")
@@ -68,8 +74,10 @@ class Config:
         # Prints all config values cleanly
         return (
             f"Config(\n"
+            f"  LLM_BACKEND={getattr(self, 'LLM_BACKEND', 'ollama')!r},\n"
             f"  OLLAMA_BASE_URL={getattr(self, 'OLLAMA_BASE_URL', None)!r},\n"
             f"  OLLAMA_MODEL={getattr(self, 'OLLAMA_MODEL', None)!r},\n"
+            f"  GEMINI_MODEL={getattr(self, 'GEMINI_MODEL', None)!r},\n"
             f"  MAX_SEARCH_ATTEMPTS={getattr(self, 'MAX_SEARCH_ATTEMPTS', 1)},\n"
             f"  CONFIDENCE_THRESHOLD={getattr(self, 'CONFIDENCE_THRESHOLD', 70)},\n"
             f"  MAX_SEARCH_RESULTS={getattr(self, 'MAX_SEARCH_RESULTS', 5)},\n"

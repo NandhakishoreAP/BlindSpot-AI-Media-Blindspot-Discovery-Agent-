@@ -38,7 +38,7 @@ from models.data_models import (
     SearchResult,
     Evidence
 )
-from llm.ollama_client import OllamaClient
+from typing import Any
 from utils.logger import get_logger
 from config import Config
 
@@ -47,11 +47,8 @@ class EvidenceEvaluator:
     Evaluates external search results to determine their relationship to original article claims.
     """
 
-    def __init__(self, ollama_client: OllamaClient, config: Config) -> None:
-        """
-        Initializes the EvidenceEvaluator with an OllamaClient and Config.
-        """
-        self.ollama_client: OllamaClient = ollama_client
+    def __init__(self, ollama_client: Any, config: Config) -> None:
+        self.ollama_client: Any = ollama_client
         self.config: Config = config
         self.logger = get_logger("evidence_evaluator")
 
@@ -293,7 +290,7 @@ Your job is to evaluate search results and determine:
                     parsed_records.append(parsed_obj)
             except Exception as e:
                 self.logger.warning(f"Repair JSON parse failed (evidence_evaluator.py:294): {e}")
-                # Use repair_json_string from ollama_client if possible
+                # Use repair_json_string from client if possible
                 try:
                     repaired = self.ollama_client.repair_json_string(cleaned_block)
                     parsed_obj = json.loads(repaired)
@@ -764,9 +761,8 @@ Your job is to evaluate search results and determine:
             self.logger.warning("No relevant search results left after overlap filtering")
             return [], False
 
-        target_model = self.ollama_client.model
-        if not self.ollama_client.pre_call_health_check(target_model):
-            self.logger.warning("Ollama pre-call health check failed. Bypassing LLM and using heuristic evaluation.")
+        if not self.ollama_client.pre_call_health_check():
+            self.logger.warning("LLM pre-call health check failed. Bypassing LLM and using heuristic evaluation.")
             result = self.heuristic_evaluate(article, claims, blindspots, search_results_sliced)
             return result, True
 
@@ -783,7 +779,7 @@ Your job is to evaluate search results and determine:
         success = False
 
         for attempt in range(1, max_attempts + 1):
-            self.logger.info(f"Sending evidence evaluation request to Ollama (Attempt {attempt}/{max_attempts})")
+            self.logger.info(f"Sending evidence evaluation request to LLM (Attempt {attempt}/{max_attempts})")
             start_time = time.time()
             try:
                 response_text = self.ollama_client.generate(
@@ -794,7 +790,7 @@ Your job is to evaluate search results and determine:
                     timeout=10.0
                 )
                 elapsed = time.time() - start_time
-                self.logger.info(f"Ollama request attempt {attempt} finished in {int(elapsed)} seconds")
+                self.logger.info(f"LLM request attempt {attempt} finished in {int(elapsed)} seconds")
 
                 if response_text:
                     evaluations = self.safe_json_parse(response_text)
@@ -1232,8 +1228,9 @@ if __name__ == "__main__":
         # Load config
         config = Config.from_env()
 
-        # Create OllamaClient and EvidenceEvaluator
-        ollama_client = OllamaClient(config)
+        # Create LLM client and EvidenceEvaluator
+        from llm.client_factory import create_llm_client
+        ollama_client = create_llm_client(config)
         evaluator = EvidenceEvaluator(ollama_client, config)
 
         # Import SearchTool only here

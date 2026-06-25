@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Any
 import re
 
 from models.data_models import (
@@ -7,7 +7,6 @@ from models.data_models import (
     Blindspot
 )
 
-from llm.ollama_client import OllamaClient
 from utils.logger import get_logger
 from config import Config
 
@@ -16,11 +15,11 @@ class BlindspotDetector:
     Identifies missing perspectives, stakeholder voices, and omitted context from articles.
     """
 
-    def __init__(self, ollama_client: OllamaClient, config: Config) -> None:
+    def __init__(self, ollama_client: Any, config: Config) -> None:
         """
         Store both arguments as instance attributes and initialize the logger.
         """
-        self.ollama_client: OllamaClient = ollama_client
+        self.ollama_client: Any = ollama_client
         self.config: Config = config
         self.logger = get_logger("blindspot_detector")
 
@@ -457,8 +456,8 @@ class BlindspotDetector:
         try:
             self.logger.info(f"Detecting blindspots for: {article.title}")
 
-            if not self.ollama_client.pre_call_health_check(self.config.MODEL_BLINDSPOT_DETECTOR):
-                self.logger.warning("Ollama pre-call health check failed. Skipping LLM blindspot detection and using deterministic fallback.")
+            if not self.ollama_client.pre_call_health_check():
+                self.logger.warning("LLM pre-call health check failed. Skipping LLM blindspot detection and using deterministic fallback.")
                 self.link_claims_to_blindspots(fallback_blindspots, claims)
                 return fallback_blindspots, True
 
@@ -471,7 +470,6 @@ class BlindspotDetector:
                 temperature=0.2,
                 num_predict=256,
                 max_retries=0,
-                model=self.config.MODEL_BLINDSPOT_DETECTOR,
                 timeout=10.0
             )
 
@@ -544,7 +542,6 @@ class BlindspotDetector:
                     temperature=0.4,
                     num_predict=256,
                     max_retries=0,
-                    model=self.config.MODEL_BLINDSPOT_DETECTOR,
                     timeout=10.0
                 )
                 self.logger.debug(f"Regenerated blindspot response: {response}")
@@ -583,8 +580,9 @@ class BlindspotDetector:
 
 if __name__ == "__main__":
     try:
+        from llm.client_factory import create_llm_client
         config = Config.from_env()
-        client = OllamaClient(config)
+        client = create_llm_client(config)
         detector = BlindspotDetector(client, config)
 
         # Create ArticleData

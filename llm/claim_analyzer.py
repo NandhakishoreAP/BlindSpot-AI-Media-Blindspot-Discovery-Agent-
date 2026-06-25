@@ -1,7 +1,7 @@
 import json
 import time
 from models.data_models import ArticleData, ClaimAnalysis
-from llm.ollama_client import OllamaClient, ExtractionPreset
+from typing import Any
 from utils.logger import get_logger
 from config import Config
 import os
@@ -12,11 +12,8 @@ class ClaimAnalyzer:
     Analyzes news articles to identify main topics, key claims, stance, tone, and framing.
     """
 
-    def __init__(self, ollama_client: OllamaClient, config: Config) -> None:
-        """
-        Initializes the ClaimAnalyzer with an OllamaClient and Config.
-        """
-        self.ollama_client: OllamaClient = ollama_client
+    def __init__(self, ollama_client: Any, config: Config) -> None:
+        self.ollama_client: Any = ollama_client
         self.config: Config = config
         self.logger = get_logger("claim_analyzer")
 
@@ -375,11 +372,30 @@ class ClaimAnalyzer:
 
             self.logger.info(f"Analyzing claims for: {article.title}")
 
-            if not self.ollama_client.pre_call_health_check(self.config.MODEL_CLAIM_ANALYZER):
-                self.logger.warning("Ollama pre-call health check failed. Skipping LLM claim analysis and using deterministic fallback.")
+            if not self.ollama_client.pre_call_health_check():
+                self.logger.warning("LLM pre-call health check failed. Skipping LLM claim analysis and using deterministic fallback.")
                 return fallback_claims, True
 
-            framing_summary = response.get("framing_summary")
+            analysis_prompt = self._build_analysis_prompt(article)
+            system_prompt = self._build_system_prompt()
+
+            self.logger.info("Calling LLM for claim analysis")
+
+            response = self.ollama_client.generate_json_with_retry(
+                prompt=analysis_prompt,
+                system_prompt=system_prompt,
+                temperature=0.2,
+                num_predict=192,
+                num_ctx=4096,
+                max_retries=0,
+                timeout=10.0
+            )
+
+            main_topic = response.get("main_topic", "Unknown")
+            key_claims = response.get("key_claims", [])
+            author_stance = response.get("author_stance", "Neutral")
+            tone = response.get("tone", "Informative")
+            framing_summary = response.get("framing_summary", "")
 
             def get_fallback_field(field_name: str, current_val: str) -> str:
                 if isinstance(current_val, str) and current_val.strip() not in ("", "Unknown"):
@@ -526,11 +542,13 @@ class ClaimAnalyzer:
 
 if __name__ == "__main__":
     try:
+        from llm.client_factory import create_llm_client
+
         # Load config
         config = Config.from_env()
 
-        # Create OllamaClient
-        client = OllamaClient(config)
+        # Create LLM client
+        client = create_llm_client(config)
 
         # Create ClaimAnalyzer
         analyzer = ClaimAnalyzer(client, config)

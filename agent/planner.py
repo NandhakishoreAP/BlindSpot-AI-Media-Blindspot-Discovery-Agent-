@@ -12,7 +12,7 @@ from models.data_models import (
     SearchResult
 )
 
-from llm.ollama_client import OllamaClient
+from typing import Any
 from utils.logger import get_logger
 from config import Config
 
@@ -21,11 +21,8 @@ class Planner:
     The decision-making brain of the agent that determines search steps and when to finalize research.
     """
 
-    def __init__(self, ollama_client: OllamaClient, config: Config) -> None:
-        """
-        Initializes the Planner with an OllamaClient and Config.
-        """
-        self.ollama_client: OllamaClient = ollama_client
+    def __init__(self, ollama_client: Any, config: Config) -> None:
+        self.ollama_client: Any = ollama_client
         self.config: Config = config
         self.logger = get_logger("planner")
         self.confidence_threshold: int = config.CONFIDENCE_THRESHOLD
@@ -559,8 +556,8 @@ No explanations outside the JSON.
                 )
 
             # If none of the rule-based shortcuts trigger, call the LLM planner.
-            if not self.ollama_client.pre_call_health_check(self.config.OLLAMA_MODEL):
-                self.logger.warning("Ollama pre-call health check failed. Skipping LLM planner decision and using fallback queries.")
+            if not self.ollama_client.pre_call_health_check():
+                self.logger.warning("LLM pre-call health check failed. Skipping LLM planner decision and using fallback queries.")
                 fallback_intents = self._generate_initial_queries(state)
                 fb_texts = [qi.query_text for qi in fallback_intents]
                 return PlannerDecision(
@@ -641,7 +638,8 @@ if __name__ == "__main__":
         config = Config.from_env()
 
         # Create components
-        client = OllamaClient(config)
+        from llm.client_factory import create_llm_client
+        client = create_llm_client(config)
         planner = Planner(client, config)
 
         # 1. SCENARIO 1 Setup

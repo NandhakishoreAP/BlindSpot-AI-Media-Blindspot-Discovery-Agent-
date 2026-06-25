@@ -45,13 +45,14 @@ class EntityExtractor:
 
     def _llm_extract(self, text: str) -> Optional[dict]:
         try:
-            from llm.ollama_client import OllamaClient
             from config import Config
+            from llm.client_factory import create_llm_client
 
             config = Config.from_env()
-            client = OllamaClient(config)
+            client = create_llm_client(config)
 
-            if not client.health_check():
+            if not client.available:
+                self.logger.info("LLM extraction skipped (backend unavailable)")
                 return None
 
             prompt = (
